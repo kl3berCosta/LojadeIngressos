@@ -1,0 +1,5 @@
+aws_region = "us-east-1"
+project_name = "stadiumtickets"
+environment = "dev"
+frontend_bucket_name = "stadium-tickets-frontend-demo"
+admin_email = "admin@example.com"

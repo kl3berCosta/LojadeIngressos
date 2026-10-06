@@ -1,0 +1,45 @@
+{
+  "users": [
+    {
+      "id": "user-1790915239505",
+      "name": "Maria Souza",
+      "email": "maria@email.com",
+      "passwordHash": "3673c9461cad2da161e528894958580e4e4538cb0ca19a71c749632f634d6e13",
+      "createdAt": "2026-10-02T04:27:19.507Z"
+    }
+  ],
+  "orders": [],
+  "events": [
+    {
+      "id": "match-1",
+      "teamHome": "São Paulo FC",
+      "teamAway": "Palmeiras",
+      "stadium": "Estádio do Morumbi",
+      "date": "2026-10-15T18:30:00",
+      "price": 120,
+      "available": 320,
+      "category": "Arquibancada"
+    },
+    {
+      "id": "match-2",
+      "teamHome": "Flamengo",
+      "teamAway": "Vasco",
+      "stadium": "Maracanã",
+      "date": "2026-10-22T20:00:00",
+      "price": 180,
+      "available": 210,
+      "category": "Cadeiras laterais"
+    },
+    {
+      "id": "match-3",
+      "teamHome": "Grêmio",
+      "teamAway": "Internacional",
+      "stadium": "Arena do Grêmio",
+      "date": "2026-10-29T19:45:00",
+      "price": 150,
+      "available": 260,
+      "category": "Superior"
+    }
+  ],
+  "products": []
+}
