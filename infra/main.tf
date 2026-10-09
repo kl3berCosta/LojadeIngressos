@@ -6,9 +6,9 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
-    archive = {
-      source  = "hashicorp/archive"
-      version = "~> 2.0"
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.5"
     }
   }
 }
@@ -17,139 +17,271 @@ provider "aws" {
   region = var.aws_region
 }
 
+# Sufixo aleatório para recursos que exigem nomes globais únicos (S3)
+resource "random_id" "suffix" {
+  byte_length = 4
+}
+
 locals {
   project_name = var.project_name
+  bucket_name  = var.banners_bucket_name != "" ? var.banners_bucket_name : "${var.project_name}-banners-${random_id.suffix.hex}"
   tags = {
     Project     = local.project_name
     Environment = var.environment
     ManagedBy   = "Terraform"
+    Disciplina  = "SoftwareParaNuvem-UFC"
   }
 }
 
-resource "aws_s3_bucket" "frontend" {
-  bucket = var.frontend_bucket_name
-  tags   = local.tags
+# -------------------------------------------------------------------
+# REDE: VPC PADRÃO & SUBNETS (Compatível com AWS Academy & Contas Padrão)
+# -------------------------------------------------------------------
+data "aws_vpc" "default" {
+  default = true
 }
 
-resource "aws_s3_bucket_ownership_controls" "frontend" {
-  bucket = aws_s3_bucket.frontend.id
+data "aws_subnets" "default" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.default.id]
+  }
+}
 
+# -------------------------------------------------------------------
+# SECURITY GROUPS (Menor Privilégio)
+# -------------------------------------------------------------------
+
+# 1. Security Group para o Load Balancer (ALB)
+resource "aws_security_group" "alb" {
+  name        = "${local.project_name}-alb-sg"
+  description = "Permite trafego HTTP publico da internet para o ALB"
+  vpc_id      = data.aws_vpc.default.id
+
+  ingress {
+    description = "HTTP da internet"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    description = "Trafego de saida liberado"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = local.tags
+}
+
+# 2. Security Group para as Instâncias EC2 da Aplicação
+resource "aws_security_group" "ec2" {
+  name        = "${local.project_name}-ec2-sg"
+  description = "Permite trafego vindo exclusivamente do ALB"
+  vpc_id      = data.aws_vpc.default.id
+
+  ingress {
+    description     = "HTTP vindo do Load Balancer"
+    from_port       = 3000
+    to_port         = 3000
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb.id]
+  }
+
+  ingress {
+    description = "SSH para administracao direta (opcional)"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    description = "Trafego de saida liberado"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = local.tags
+}
+
+# 3. Security Group para o Banco Relacional Amazon RDS PostgreSQL
+resource "aws_security_group" "rds" {
+  name        = "${local.project_name}-rds-sg"
+  description = "Permite conexao PostgreSQL vinda das instancias EC2"
+  vpc_id      = data.aws_vpc.default.id
+
+  ingress {
+    description     = "PostgreSQL vindo das EC2"
+    from_port       = 5432
+    to_port         = 5432
+    protocol        = "tcp"
+    security_groups = [aws_security_group.ec2.id]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = local.tags
+}
+
+# 4. Security Group para o Amazon ElastiCache Redis
+resource "aws_security_group" "redis" {
+  name        = "${local.project_name}-redis-sg"
+  description = "Permite conexao Redis vinda das instancias EC2"
+  vpc_id      = data.aws_vpc.default.id
+
+  ingress {
+    description     = "Redis vindo das EC2"
+    from_port       = 6379
+    to_port         = 6379
+    protocol        = "tcp"
+    security_groups = [aws_security_group.ec2.id]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = local.tags
+}
+
+# -------------------------------------------------------------------
+# IAM ROLE & INSTANCE PROFILE PARA AS INSTÂNCIAS EC2
+# -------------------------------------------------------------------
+resource "aws_iam_role" "ec2" {
+  count = var.use_existing_lab_role ? 0 : 1
+  name  = "${local.project_name}-ec2-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Principal = {
+        Service = "ec2.amazonaws.com"
+      }
+      Action = "sts:AssumeRole"
+    }]
+  })
+
+  tags = local.tags
+}
+
+resource "aws_iam_policy" "app_permissions" {
+  count = var.use_existing_lab_role ? 0 : 1
+  name  = "${local.project_name}-app-policy"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:PutObject",
+          "s3:GetObject",
+          "s3:ListBucket"
+        ]
+        Resource = [
+          aws_s3_bucket.banners.arn,
+          "${aws_s3_bucket.banners.arn}/*"
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "dynamodb:PutItem",
+          "dynamodb:GetItem",
+          "dynamodb:Scan",
+          "dynamodb:Query",
+          "dynamodb:UpdateItem"
+        ]
+        Resource = aws_dynamodb_table.audit_logs.arn
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "sqs:SendMessage",
+          "sqs:ReceiveMessage",
+          "sqs:DeleteMessage",
+          "sqs:GetQueueAttributes"
+        ]
+        Resource = aws_sqs_queue.banner_tasks.arn
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "sns:Publish"
+        ]
+        Resource = aws_sns_topic.banner_tasks.arn
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ec2_attach" {
+  count      = var.use_existing_lab_role ? 0 : 1
+  role       = aws_iam_role.ec2[0].name
+  policy_arn = aws_iam_policy.app_permissions[0].arn
+}
+
+resource "aws_iam_instance_profile" "ec2" {
+  count = var.use_existing_lab_role ? 0 : 1
+  name  = "${local.project_name}-ec2-profile"
+  role  = aws_iam_role.ec2[0].name
+}
+
+# -------------------------------------------------------------------
+# PARTE 1 - SERVIÇO 3: AMAZON S3 (Arquivos Binários - Banners dos Jogos)
+# -------------------------------------------------------------------
+resource "aws_s3_bucket" "banners" {
+  bucket        = local.bucket_name
+  force_destroy = true
+  tags          = local.tags
+}
+
+resource "aws_s3_bucket_ownership_controls" "banners" {
+  bucket = aws_s3_bucket.banners.id
   rule {
     object_ownership = "BucketOwnerPreferred"
   }
 }
 
-resource "aws_s3_bucket_public_access_block" "frontend" {
-  bucket = aws_s3_bucket.frontend.id
+resource "aws_s3_bucket_public_access_block" "banners" {
+  bucket = aws_s3_bucket.banners.id
 
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
+  block_public_acls       = false
+  block_public_policy     = false
+  ignore_public_acls      = false
+  restrict_public_buckets = false
 }
 
-resource "aws_cloudfront_origin_access_control" "frontend_oac" {
-  name                              = "${local.project_name}-oac"
-  description                       = "Origin Access Control for Stadium Tickets frontend"
-  origin_access_control_origin_type = "s3"
-  signing_behavior                  = "always"
-  signing_protocol                  = "sigv4"
-}
+resource "aws_s3_bucket_cors_configuration" "banners" {
+  bucket = aws_s3_bucket.banners.id
 
-resource "aws_cloudfront_distribution" "frontend" {
-  enabled             = true
-  is_ipv6_enabled     = true
-  comment             = "Frontend distribution for Stadium Tickets"
-  default_root_object = "index.html"
-  price_class         = "PriceClass_100"
-
-  origin {
-    domain_name              = aws_s3_bucket.frontend.bucket_regional_domain_name
-    origin_id                = "s3-origin"
-    origin_access_control_id = aws_cloudfront_origin_access_control.frontend_oac.id
+  cors_rule {
+    allowed_headers = ["*"]
+    allowed_methods = ["GET", "PUT", "POST"]
+    allowed_origins = ["*"]
+    max_age_seconds = 3000
   }
-
-  default_cache_behavior {
-    allowed_methods        = ["GET", "HEAD", "OPTIONS"]
-    cached_methods         = ["GET", "HEAD"]
-    target_origin_id       = "s3-origin"
-    viewer_protocol_policy = "redirect-to-https"
-    compress               = true
-
-    forwarded_values {
-      query_string = false
-      cookies {
-        forward = "none"
-      }
-    }
-  }
-
-  restrictions {
-    geo_restriction {
-      restriction_type = "none"
-    }
-  }
-
-  viewer_certificate {
-    cloudfront_default_certificate = true
-  }
-
-  tags = local.tags
 }
 
-resource "aws_s3_bucket_policy" "frontend" {
-  bucket = aws_s3_bucket.frontend.id
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Sid    = "AllowCloudFrontReadOnly"
-      Effect = "Allow"
-      Principal = {
-        Service = "cloudfront.amazonaws.com"
-      }
-      Action   = "s3:GetObject"
-      Resource = "${aws_s3_bucket.frontend.arn}/*"
-      Condition = {
-        StringEquals = {
-          "AWS:SourceArn" = aws_cloudfront_distribution.frontend.arn
-        }
-      }
-    }]
-  })
-}
-
-resource "aws_cognito_user_pool" "main" {
-  name = "${local.project_name}-users"
-
-  auto_verified_attributes = ["email"]
-
-  schema {
-    name                     = "email"
-    attribute_data_type      = "String"
-    required                 = true
-    mutable                  = true
-    developer_only_attribute = false
-  }
-
-  tags = local.tags
-}
-
-resource "aws_cognito_user_pool_client" "main" {
-  name         = "${local.project_name}-client"
-  user_pool_id = aws_cognito_user_pool.main.id
-
-  generate_secret                      = false
-  explicit_auth_flows                  = ["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"]
-  prevent_user_existence_errors        = "ENABLED"
-  supported_identity_providers         = ["COGNITO"]
-  allowed_oauth_flows_user_pool_client = true
-  allowed_oauth_flows                  = ["code", "implicit"]
-  allowed_oauth_scopes                 = ["openid", "email", "profile"]
-}
-
-resource "aws_dynamodb_table" "orders" {
-  name         = "${local.project_name}-orders"
+# -------------------------------------------------------------------
+# PARTE 1 - SERVIÇO 5: AMAZON DYNAMODB (Auditoria NoSQL do CRUD)
+# -------------------------------------------------------------------
+resource "aws_dynamodb_table" "audit_logs" {
+  name         = "${local.project_name}-audit-logs"
   billing_mode = "PAY_PER_REQUEST"
   hash_key     = "id"
 
@@ -161,192 +293,194 @@ resource "aws_dynamodb_table" "orders" {
   tags = local.tags
 }
 
-resource "aws_sqs_queue" "orders" {
-  name                       = "${local.project_name}-orders-queue"
+# -------------------------------------------------------------------
+# PARTE 1 - SERVIÇO 6: AMAZON SQS & SNS (Desacoplamento do Worker)
+# -------------------------------------------------------------------
+resource "aws_sqs_queue" "banner_tasks" {
+  name                       = "${local.project_name}-banner-queue"
   visibility_timeout_seconds = 180
-  message_retention_seconds  = 345600
+  message_retention_seconds  = 86400
 
   tags = local.tags
 }
 
-resource "aws_ses_email_identity" "admin" {
-  email = var.admin_email
-}
-
-resource "aws_cloudwatch_log_group" "api" {
-  name              = "/aws/lambda/${local.project_name}-orders"
-  retention_in_days = 14
-  tags              = local.tags
-}
-
-resource "aws_iam_role" "lambda_exec" {
-  name = "${local.project_name}-lambda-exec-role"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect = "Allow"
-      Principal = {
-        Service = "lambda.amazonaws.com"
-      }
-      Action = "sts:AssumeRole"
-    }]
-  })
-
+resource "aws_sns_topic" "banner_tasks" {
+  name = "${local.project_name}-banner-topic"
   tags = local.tags
 }
 
-resource "aws_iam_policy" "lambda_policy" {
-  name = "${local.project_name}-lambda-policy"
+resource "aws_sns_topic_subscription" "sqs_sub" {
+  topic_arn = aws_sns_topic.banner_tasks.arn
+  protocol  = "sqs"
+  endpoint  = aws_sqs_queue.banner_tasks.arn
+}
+
+resource "aws_sqs_queue_policy" "sqs_policy" {
+  queue_url = aws_sqs_queue.banner_tasks.id
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = [
-          "logs:CreateLogStream",
-          "logs:PutLogEvents"
-        ],
-        Resource = "arn:aws:logs:${var.aws_region}:*:log-group:/aws/lambda/${local.project_name}-orders:*"
-      },
-      {
-        Effect = "Allow"
-        Action = [
-          "dynamodb:PutItem",
-          "dynamodb:GetItem",
-          "dynamodb:UpdateItem",
-          "dynamodb:Scan"
-        ],
-        Resource = aws_dynamodb_table.orders.arn
-      },
-      {
-        Effect = "Allow"
-        Action = [
-          "sqs:SendMessage"
-        ],
-        Resource = aws_sqs_queue.orders.arn
+    Statement = [{
+      Sid       = "AllowSNS"
+      Effect    = "Allow"
+      Principal = "*"
+      Action    = "sqs:SendMessage"
+      Resource  = aws_sqs_queue.banner_tasks.arn
+      Condition = {
+        ArnEquals = {
+          "aws:SourceArn" = aws_sns_topic.banner_tasks.arn
+        }
       }
-    ]
+    }]
   })
 }
 
-resource "aws_iam_role_policy_attachment" "lambda_basic" {
-  role       = aws_iam_role.lambda_exec.name
-  policy_arn = aws_iam_policy.lambda_policy.arn
+# -------------------------------------------------------------------
+# PARTE 1 - SERVIÇO 2: AMAZON RDS (PostgreSQL Relacional)
+# -------------------------------------------------------------------
+resource "aws_db_subnet_group" "rds" {
+  name       = "${local.project_name}-rds-subnets"
+  subnet_ids = data.aws_subnets.default.ids
+  tags       = local.tags
 }
 
-data "archive_file" "lambda_zip" {
-  type        = "zip"
-  source_dir  = "${path.module}/lambda/order-handler"
-  output_path = "${path.module}/lambda/order-handler.zip"
+resource "aws_db_instance" "postgres" {
+  identifier             = "${local.project_name}-db"
+  allocated_storage      = 20
+  max_allocated_storage  = 50
+  engine                 = "postgres"
+  engine_version         = "16.3"
+  instance_class         = var.db_instance_class
+  db_name                = var.db_name
+  username               = var.db_username
+  password               = var.db_password
+  db_subnet_group_name   = aws_db_subnet_group.rds.name
+  vpc_security_group_ids = [aws_security_group.rds.id]
+  publicly_accessible    = true
+  skip_final_snapshot    = true
+
+  tags = local.tags
 }
 
-resource "aws_lambda_function" "orders" {
-  function_name = "${local.project_name}-orders"
-  role          = aws_iam_role.lambda_exec.arn
-  runtime       = "nodejs20.x"
-  handler       = "index.handler"
-  filename      = data.archive_file.lambda_zip.output_path
-  timeout       = 30
-  memory_size   = 512
+# -------------------------------------------------------------------
+# PARTE 1 - SERVIÇO 4: AMAZON ELASTICACHE (Redis para Cache)
+# -------------------------------------------------------------------
+resource "aws_elasticache_subnet_group" "redis" {
+  name       = "${local.project_name}-redis-subnets"
+  subnet_ids = data.aws_subnets.default.ids
+  tags       = local.tags
+}
 
-  environment {
-    variables = {
-      TABLE_NAME = aws_dynamodb_table.orders.name
-      SQS_QUEUE_URL = aws_sqs_queue.orders.url
-    }
+resource "aws_elasticache_cluster" "redis" {
+  cluster_id           = "${local.project_name}-redis"
+  engine               = "redis"
+  node_type            = var.redis_node_type
+  num_cache_nodes      = 1
+  parameter_group_name = "default.redis7"
+  port                 = 6379
+  subnet_group_name    = aws_elasticache_subnet_group.redis.name
+  security_group_ids   = [aws_security_group.redis.id]
+
+  tags = local.tags
+}
+
+# -------------------------------------------------------------------
+# PARTE 2: APPLICATION LOAD BALANCER (ALB)
+# -------------------------------------------------------------------
+resource "aws_lb" "app" {
+  name               = "${local.project_name}-alb"
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.alb.id]
+  subnets            = data.aws_subnets.default.ids
+
+  tags = local.tags
+}
+
+resource "aws_lb_target_group" "app" {
+  name        = "${local.project_name}-tg"
+  port        = 3000
+  protocol    = "HTTP"
+  vpc_id      = data.aws_vpc.default.id
+  target_type = "instance"
+
+  health_check {
+    path                = "/health"
+    protocol            = "HTTP"
+    matcher             = "200"
+    interval            = 15
+    timeout             = 5
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
   }
 
   tags = local.tags
 }
 
-resource "aws_api_gateway_rest_api" "api" {
-  name        = "${local.project_name}-api"
-  description = "API for Stadium Tickets"
+resource "aws_lb_listener" "http" {
+  load_balancer_arn = aws_lb.app.arn
+  port              = 80
+  protocol          = "HTTP"
 
-  tags = local.tags
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.app.arn
+  }
 }
 
-resource "aws_api_gateway_resource" "health" {
-  rest_api_id = aws_api_gateway_rest_api.api.id
-  parent_id   = aws_api_gateway_rest_api.api.root_resource_id
-  path_part   = "health"
+# -------------------------------------------------------------------
+# PARTE 2: LAUNCH TEMPLATE & AUTO SCALING GROUP (EC2)
+# -------------------------------------------------------------------
+
+# Busca AMI mais recente do Ubuntu 22.04 LTS
+data "aws_ami" "ubuntu" {
+  most_recent = true
+  owners      = ["099720109477"] # Canonical
+
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
 }
 
-resource "aws_api_gateway_resource" "orders" {
-  rest_api_id = aws_api_gateway_rest_api.api.id
-  parent_id   = aws_api_gateway_rest_api.api.root_resource_id
-  path_part   = "orders"
-}
+resource "aws_launch_template" "app" {
+  name_prefix   = "${local.project_name}-template-"
+  image_id      = data.aws_ami.ubuntu.id
+  instance_type = var.instance_type
 
-resource "aws_api_gateway_method" "health_get" {
-  rest_api_id   = aws_api_gateway_rest_api.api.id
-  resource_id   = aws_api_gateway_resource.health.id
-  http_method   = "GET"
-  authorization = "NONE"
-}
+  network_interfaces {
+    associate_public_ip_address = true
+    security_groups             = [aws_security_group.ec2.id]
+  }
 
-resource "aws_api_gateway_method" "orders_post" {
-  rest_api_id   = aws_api_gateway_rest_api.api.id
-  resource_id   = aws_api_gateway_resource.orders.id
-  http_method   = "POST"
-  authorization = "NONE"
-}
+  iam_instance_profile {
+    name = var.use_existing_lab_role ? var.lab_role_name : aws_iam_instance_profile.ec2[0].name
+  }
 
-resource "aws_api_gateway_integration" "health_integration" {
-  rest_api_id = aws_api_gateway_rest_api.api.id
-  resource_id = aws_api_gateway_resource.health.id
-  http_method = aws_api_gateway_method.health_get.http_method
+  user_data = base64encode(templatefile("${path.module}/user_data.sh.tpl", {
+    repo_url            = var.repo_url
+    aws_region          = var.aws_region
+    db_username         = var.db_username
+    db_password         = var.db_password
+    rds_endpoint        = aws_db_instance.postgres.endpoint
+    db_name             = var.db_name
+    redis_host          = aws_elasticache_cluster.redis.cache_nodes[0].address
+    s3_bucket_name      = aws_s3_bucket.banners.id
+    dynamodb_table_name = aws_dynamodb_table.audit_logs.name
+    sqs_queue_url       = aws_sqs_queue.banner_tasks.url
+    sns_topic_arn       = aws_sns_topic.banner_tasks.arn
+  }))
 
-  integration_http_method = "POST"
-  type                    = "AWS_PROXY"
-  uri                     = aws_lambda_function.orders.invoke_arn
-}
-
-resource "aws_api_gateway_integration" "orders_integration" {
-  rest_api_id = aws_api_gateway_rest_api.api.id
-  resource_id = aws_api_gateway_resource.orders.id
-  http_method = aws_api_gateway_method.orders_post.http_method
-
-  integration_http_method = "POST"
-  type                    = "AWS_PROXY"
-  uri                     = aws_lambda_function.orders.invoke_arn
-}
-
-resource "aws_lambda_permission" "api_gateway_health" {
-  statement_id  = "AllowExecutionFromAPIGatewayHealth"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.orders.function_name
-  principal     = "apigateway.amazonaws.com"
-  source_arn    = "arn:aws:execute-api:${var.aws_region}:${data.aws_caller_identity.current.account_id}:${aws_api_gateway_rest_api.api.id}/*/*"
-}
-
-resource "aws_lambda_permission" "api_gateway_orders" {
-  statement_id  = "AllowExecutionFromAPIGatewayOrders"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.orders.function_name
-  principal     = "apigateway.amazonaws.com"
-  source_arn    = "arn:aws:execute-api:${var.aws_region}:${data.aws_caller_identity.current.account_id}:${aws_api_gateway_rest_api.api.id}/*/*"
-}
-
-resource "aws_api_gateway_deployment" "api" {
-  depends_on = [
-    aws_api_gateway_integration.health_integration,
-    aws_api_gateway_integration.orders_integration
-  ]
-
-  rest_api_id = aws_api_gateway_rest_api.api.id
-
-  triggers = {
-    redeployment = sha1(jsonencode([
-      aws_api_gateway_resource.health.id,
-      aws_api_gateway_resource.orders.id,
-      aws_api_gateway_method.health_get.id,
-      aws_api_gateway_method.orders_post.id,
-      aws_api_gateway_integration.health_integration.id,
-      aws_api_gateway_integration.orders_integration.id
-    ]))
+  tag_specifications {
+    resource_type = "instance"
+    tags = merge(local.tags, {
+      Name = "${local.project_name}-ec2"
+    })
   }
 
   lifecycle {
@@ -354,12 +488,84 @@ resource "aws_api_gateway_deployment" "api" {
   }
 }
 
-resource "aws_api_gateway_stage" "dev" {
-  deployment_id = aws_api_gateway_deployment.api.id
-  rest_api_id   = aws_api_gateway_rest_api.api.id
-  stage_name    = "dev"
+resource "aws_autoscaling_group" "app" {
+  name_prefix         = "${local.project_name}-asg-"
+  min_size            = 1
+  max_size            = 3
+  desired_capacity    = 1
+  vpc_zone_identifier = data.aws_subnets.default.ids
+  target_group_arns   = [aws_lb_target_group.app.arn]
+  health_check_type   = "ELB"
+  health_check_grace_period = 180
 
-  tags = local.tags
+  launch_template {
+    id      = aws_launch_template.app.id
+    version = "$Latest"
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+
+  tag {
+    key                 = "Name"
+    value               = "${local.project_name}-asg-instance"
+    propagate_at_launch = true
+  }
 }
 
-data "aws_caller_identity" "current" {}
+# -------------------------------------------------------------------
+# PARTE 2: REGRAS DE ELASTICIDADE (CloudWatch Alarms & Scaling Policies)
+# -------------------------------------------------------------------
+
+# REGRA c): Se CPU > 70% por mais de 1 minuto -> Adiciona +1 instância (Máx 3)
+resource "aws_autoscaling_policy" "scale_out" {
+  name                   = "${local.project_name}-scale-out"
+  scaling_adjustment     = 1
+  adjustment_type        = "ChangeInCapacity"
+  cooldown               = 60
+  autoscaling_group_name = aws_autoscaling_group.app.name
+}
+
+resource "aws_cloudwatch_metric_alarm" "cpu_high" {
+  alarm_name          = "${local.project_name}-cpu-high-gt-70"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = 60 # 1 minuto
+  statistic           = "Average"
+  threshold           = 70 # 70%
+  alarm_description   = "Aciona Scale-Out se uso medio de CPU exceder 70% por mais de 1 minuto"
+  alarm_actions       = [aws_autoscaling_policy.scale_out.arn]
+
+  dimensions = {
+    AutoScalingGroupName = aws_autoscaling_group.app.name
+  }
+}
+
+# REGRA d): Se CPU < 25% por mais de 1 minuto -> Remove -1 instância (Mín 1)
+resource "aws_autoscaling_policy" "scale_in" {
+  name                   = "${local.project_name}-scale-in"
+  scaling_adjustment     = -1
+  adjustment_type        = "ChangeInCapacity"
+  cooldown               = 60
+  autoscaling_group_name = aws_autoscaling_group.app.name
+}
+
+resource "aws_cloudwatch_metric_alarm" "cpu_low" {
+  alarm_name          = "${local.project_name}-cpu-low-lt-25"
+  comparison_operator = "LessThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = 60 # 1 minuto
+  statistic           = "Average"
+  threshold           = 25 # 25%
+  alarm_description   = "Aciona Scale-In se uso medio de CPU ficar abaixo de 25% por mais de 1 minuto"
+  alarm_actions       = [aws_autoscaling_policy.scale_in.arn]
+
+  dimensions = {
+    AutoScalingGroupName = aws_autoscaling_group.app.name
+  }
+}

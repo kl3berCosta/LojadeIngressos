@@ -1,12 +1,14 @@
 {
   "name": "stadium-ticket-store-api",
   "version": "1.0.0",
-  "description": "API para loja virtual de ingressos de futebol",
+  "description": "API para loja virtual de ingressos de futebol com arquitetura AWS desacoplada",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
+    "worker": "node worker.js",
+    "worker:once": "node worker.js --once",
     "dev": "node --watch server.js",
-    "test": "node --test"
+    "test": "node --test test-api.test.js"
   },
   "dependencies": {
     "aws-sdk": "^2.1693.0",

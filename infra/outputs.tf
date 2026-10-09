@@ -1,29 +1,54 @@
-output "frontend_bucket_name" {
-  description = "Nome do bucket S3 para o frontend"
-  value       = aws_s3_bucket.frontend.bucket
+output "application_url" {
+  description = "URL pública de acesso à Loja de Ingressos através do Application Load Balancer (ALB)"
+  value       = "http://${aws_lb.app.dns_name}"
 }
 
-output "cloudfront_url" {
-  description = "URL pública do CloudFront"
-  value       = "https://${aws_cloudfront_distribution.frontend.domain_name}"
+output "alb_dns_name" {
+  description = "DNS Name do Application Load Balancer"
+  value       = aws_lb.app.dns_name
 }
 
-output "api_gateway_url" {
-  description = "URL do endpoint da API"
-  value       = "https://${aws_api_gateway_rest_api.api.id}.execute-api.${var.aws_region}.amazonaws.com/${aws_api_gateway_stage.dev.stage_name}"
+output "rds_endpoint" {
+  description = "Endpoint do banco de dados relacional Amazon RDS PostgreSQL"
+  value       = aws_db_instance.postgres.endpoint
 }
 
-output "user_pool_id" {
-  description = "ID do Cognito User Pool"
-  value       = aws_cognito_user_pool.main.id
+output "elasticache_endpoint" {
+  description = "Endpoint do cluster de cache Amazon ElastiCache Redis"
+  value       = aws_elasticache_cluster.redis.cache_nodes[0].address
 }
 
-output "orders_table_name" {
-  description = "Nome da tabela DynamoDB de pedidos"
-  value       = aws_dynamodb_table.orders.name
+output "s3_banners_bucket" {
+  description = "Nome do bucket Amazon S3 para arquivos binários (banners dos eventos)"
+  value       = aws_s3_bucket.banners.id
 }
 
-output "orders_queue_url" {
-  description = "URL da fila SQS de pedidos"
-  value       = aws_sqs_queue.orders.url
+output "dynamodb_audit_table" {
+  description = "Nome da tabela Amazon DynamoDB para auditoria NoSQL de ações do CRUD"
+  value       = aws_dynamodb_table.audit_logs.name
+}
+
+output "sqs_queue_url" {
+  description = "URL da fila Amazon SQS para processamento assíncrono de banners"
+  value       = aws_sqs_queue.banner_tasks.url
+}
+
+output "sns_topic_arn" {
+  description = "ARN do tópico Amazon SNS para notificações assíncronas"
+  value       = aws_sns_topic.banner_tasks.arn
+}
+
+output "autoscaling_group_name" {
+  description = "Nome do Auto Scaling Group gerenciando as instâncias EC2"
+  value       = aws_autoscaling_group.app.name
+}
+
+output "cloudwatch_scale_out_alarm" {
+  description = "Alarme do CloudWatch para CPU > 70% (adiciona +1 instância)"
+  value       = aws_cloudwatch_metric_alarm.cpu_high.alarm_name
+}
+
+output "cloudwatch_scale_in_alarm" {
+  description = "Alarme do CloudWatch para CPU < 25% (remove -1 instância)"
+  value       = aws_cloudwatch_metric_alarm.cpu_low.alarm_name
 }

@@ -1,99 +1,151 @@
-# Loja virtual de ingressos para jogos de futebol
+# Loja de Ingressos para Jogos de Futebol - AWS Cloud
 
-Projeto de referência para uma loja virtual de ingressos de jogos de futebol no estádio, seguindo o modelo de arquitetura em nuvem da Amazon (AWS).
+Trabalho Prático 1 da disciplina **Desenvolvimento de Software para Nuvem (UFC)**  
+**Professores:** Dr. Paulo A. L. Rego e Dr. Fernando Antonio Mota Trinta  
 
-## Visão geral
+---
 
-A plataforma permite:
+## 🎯 Visão Geral
 
-- listar jogos e disponibilidade de ingressos;
-- selecionar assentos e quantidade;
-- processar compra com confirmação de pagamento;
-- enviar confirmação por e-mail;
-- manter inventário de ingressos em tempo real;
-- escalar para alta demanda em dias de jogo.
+Plataforma de alta disponibilidade e elasticidade na nuvem AWS para venda de ingressos de jogos de futebol, implementando controle atômico de concorrência, camada de cache distribuído em memória, processamento assíncrono de banners e auditoria completa em banco NoSQL.
 
-## Arquitetura proposta na AWS
+---
+
+## 🏛️ Arquitetura na Nuvem AWS
+
+A infraestrutura foi desenhada e provisionada em conformidade com as **duas partes** solicitadas na especificação do trabalho:
 
 ```mermaid
-flowchart LR
-    User[Usuário] --> CF[CloudFront]
-    CF --> S3[Amazon S3\nFrontend estático]
-    User --> API[API Gateway\n+ Lambda / ALB]
-    API --> DDB[(Amazon DynamoDB\nEventos e pedidos)]
-    API --> SQS[(Amazon SQS\nFila de processamento)]
-    SQS --> Lambda[Lambda\nProcessa pedidos]
-    Lambda --> SES[Amazon SES\nConfirmação por e-mail]
-    Lambda --> CW[Amazon CloudWatch\nLogs e métricas]
-    User --> Cognito[Amazon Cognito\nAutenticação]
-    WAF[AWS WAF\nProteção] --> CF
-    Route53[Amazon Route 53] --> CF
+flowchart TD
+    User["🌐 Torcedor / Cliente (Navegador)"] --> ALB["⚖️ Application Load Balancer (ALB)\nPorta 80"]
+
+    subgraph ASG ["Auto Scaling Group (EC2 t3.micro | Min: 1, Max: 3)"]
+        EC2_1["💻 Instância EC2 1\n(API Express + Worker SQS)"]
+        EC2_2["💻 Instância EC2 2\n(Escala horizontal automática)"]
+    end
+
+    ALB -->|Encaminha tráfego| EC2_1
+    ALB -.->|Distribui carga| EC2_2
+
+    CW["📈 Amazon CloudWatch\nAlarme CPU > 70% (1 min) -> +1\nAlarme CPU < 25% (1 min) -> -1"] -.->|Dispara Políticas| ASG
+
+    subgraph Services ["Serviços AWS Obrigatórios (Parte 1)"]
+        RDS[("🐘 Amazon RDS\nPostgreSQL\n(Eventos e Pedidos)")]
+        Redis[("⚡ Amazon ElastiCache\nRedis\n(Cache de Ingressos Restantes)")]
+        S3[("🪣 Amazon S3\nBucket de Banners\n(Raw e Processados)")]
+        Dynamo[("📝 Amazon DynamoDB\nAuditoria NoSQL\n(Logs de CRUD com Timestamp)")]
+        SQS["📬 Amazon SQS\nFila de Processamento Assíncrono"]
+        SNS["📢 Amazon SNS\nTópico de Notificações"]
+    end
+
+    EC2_1 --> RDS
+    EC2_1 --> Redis
+    EC2_1 --> S3
+    EC2_1 --> Dynamo
+    EC2_1 -->|Publica Upload| SQS
+    SNS --> SQS
+    EC2_1 -->|Worker consome fila| SQS
 ```
 
-## Componentes principais
+---
 
-- Front-end estático: Amazon S3 + CloudFront
-- Autenticação: Amazon Cognito
-- API de compras: Amazon API Gateway + AWS Lambda ou Amazon ECS/Fargate
-- Banco de dados: Amazon DynamoDB
-- Fila assíncrona: Amazon SQS
-- Notificação por e-mail: Amazon SES
-- Monitoramento: Amazon CloudWatch + X-Ray
-- Proteção: AWS WAF
-- DNS: Amazon Route 53
+## 📋 Conformidade com os Requisitos do Trabalho
 
-## Fluxo funcional
+| Requisito do Trabalho | Serviço AWS Utilizado | Como foi implementado |
+| :--- | :--- | :--- |
+| **1. Execução na EC2** | Amazon EC2 | Aplicação Node.js rodando em instâncias EC2 (`t3.micro`) configuradas via `systemd` e `user_data`. |
+| **2. Banco Relacional** | Amazon RDS (PostgreSQL) | Persistência de eventos e pedidos com transações atômicas de concorrência garantindo que torcedores não comprem o mesmo assento. |
+| **3. Arquivo Binário** | Amazon S3 | Armazenamento dos banners oficiais dos jogos (`banners/raw/`) e dos thumbnails otimizados (`banners/processed/`). |
+| **4. Cache em Memória** | Amazon ElastiCache (Redis) | Cache acelerador de alta frequência para a listagem de jogos e estoque disponível (`events:list`), invalidado a cada nova compra. |
+| **5. Auditoria NoSQL** | Amazon DynamoDB | Registro de todas as operações de CRUD (`CREATE`, `READ`, `UPDATE`, `DELETE`, `ORDER`, `PROCESS_BANNER`) com tipo de ação, dados manipulados e timestamp. |
+| **6. Desacoplamento Assíncrono** | Amazon SNS / SQS | Webservice recebe o banner e responde `201 Created` imediatamente. O processamento pesado de rescaling com `sharp` é realizado pelo **Worker** desacoplado (`worker.js`). |
+| **Parte 2: Elasticidade Horizontal** | ALB + Auto Scaling Group | Balanceador de carga à frente de 1 a 3 instâncias com regras de escalabilidade por CPU (>70% escala +1, <25% escala -1 por mais de 1 minuto). |
 
-1. Usuário acessa a loja e navega pelos jogos disponíveis.
-2. Seleciona o estádio, a categoria do ingresso e a quantidade.
-3. Sistema valida disponibilidade do inventário.
-4. Pedido é registrado no banco de dados.
-5. Mensagem entra na fila de processamento assíncrono.
-6. Serviço de processamento confirma pagamento e atualiza estoque.
-7. E-mail de confirmação é enviado ao cliente.
-8. Usuário recebe acesso à confirmação da compra.
+---
 
-## Estrutura do projeto
+## 📂 Estrutura do Repositório
 
-- `backend/`: API para disponibilizar eventos e processar a compra
-- `frontend/`: interface da loja virtual
-- `infra/`: proposta de infraestrutura em nuvem para AWS
-- `README.md`: documentação do projeto
+```text
+├── backend/
+│   ├── server.js            # Webservice principal da API e rotas de eventos/pedidos
+│   ├── worker.js            # Worker desacoplado que consome fila SQS e processa imagens
+│   ├── schema.sql           # Esquema relacional para PostgreSQL (RDS)
+│   ├── test-api.test.js     # Testes automatizados da API e do Worker (Node test runner)
+│   └── package.json         # Dependências (Express, pg, redis, sharp, aws-sdk)
+├── frontend/
+│   ├── index.html           # Interface web com monitor AWS, vitrine, checkout e auditoria
+│   ├── app.js               # Integração assíncrona, CRUD completo e testes de estresse
+│   └── styles.css           # Estilização moderna e responsiva
+├── infra/
+│   ├── main.tf              # Provisionamento completo em Terraform (ALB, ASG, RDS, Cache, S3, DynamoDB, SQS)
+│   ├── variables.tf         # Declaração de variáveis
+│   ├── outputs.tf           # Saídas da infraestrutura (URL do ALB, endpoints dos bancos)
+│   ├── user_data.sh.tpl     # Script de bootstrap automatizado para a EC2
+│   ├── terraform.tfvars.example # Exemplo de configuração
+│   └── README.md            # Documentação da infraestrutura e roteiro de gravação do vídeo
+├── docker-compose.yml       # Ambiente local com PostgreSQL e Redis para testes
+└── README.md                # Este documento
+```
 
-## Como executar localmente
+---
 
-### Backend
+## 💻 Como Executar Localmente
 
+### 1. Iniciar Banco e Cache Locais (Opcional)
+Se desejar testar com PostgreSQL e Redis locais via Docker:
+```bash
+docker compose up -d
+```
+
+### 2. Rodar a API e o Worker
 ```bash
 cd backend
 npm install
+
+# Em um terminal, inicie a API:
 npm start
+
+# Em outro terminal, inicie o Worker desacoplado de fila:
+npm run worker
 ```
 
-A API estará disponível em `http://localhost:3000`.
+Acesse a interface no navegador em: `http://localhost:3000`
 
-### Front-end
+### 3. Rodar os Testes Automatizados
+```bash
+cd backend
+npm test
+```
+*Executa 7 testes cobrindo todas as rotas da API, healthcheck dos 6 serviços, compras concorrentes, logs do DynamoDB e processamento desacoplado do Worker.*
 
-Abra o arquivo `frontend/index.html` diretamente no navegador, ou sirva a pasta com um servidor estático.
+---
 
-## Endpoints da API
+## ☁️ Como Fazer o Deploy na AWS (Terraform)
 
-- `GET /health` – saúde da aplicação
-- `GET /events` – lista de jogos disponíveis
-- `POST /orders` – criação de pedido
+Para subir a infraestrutura completa na nuvem e obter a URL do Application Load Balancer:
 
-## Tecnologias sugeridas
+```bash
+cd infra
+cp terraform.tfvars.example terraform.tfvars
+terraform init
+terraform plan
+terraform apply -auto-approve
+```
 
-- Node.js + Express para a API
-- HTML + CSS + JavaScript para a interface
-- AWS Lambda para processamento online/assíncrono
-- DynamoDB para armazenamento
-- CloudFront + S3 para entrega do front-end
+O Terraform imprimirá a URL pública da aplicação:
+```bash
+application_url = "http://stadium-tickets-alb-XXXXX.us-east-1.elb.amazonaws.com"
+```
 
-## Próximos passos
+---
 
-- adicionar autenticação via Cognito;
-- integrar com gateway de pagamento;
-- criar filas e processamento assíncrono com SQS;
-- configurar deploy automatizado com CI/CD;
-- preparar infraestrutura com Terraform ou AWS CDK.
+## 🎥 Demonstração da Parte 2 (Vídeo do Auto Scaling)
+
+A especificação do trabalho exige um vídeo demonstrando o Auto Scaling respondendo à carga:
+1. Acesse a aplicação pela URL do Load Balancer.
+2. Na seção **"⚡ Teste de Elasticidade & Auto Scaling"**, selecione a duração de **75 segundos** e clique em **"🔥 Iniciar Carga de CPU"**.
+3. No console da AWS, acompanhe:
+   - A CPU média subindo acima de 70% por 1 minuto.
+   - O alarme do **CloudWatch** disparando a política de Scale-Out.
+   - O **Auto Scaling Group** criando uma nova instância EC2 e registrando-a no Target Group do ALB.
+   - Após o término do teste, a CPU caindo abaixo de 25% e o Auto Scaling encerrando a instância excedente.
