@@ -3,719 +3,965 @@ const cors = require('cors');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const os = require('node:os');
 const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const AWS = require('aws-sdk');
 const { Client } = require('pg');
 const Redis = require('redis');
-const sharp = require('sharp');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'stadium-ticket-secret';
 const DATA_DIR = path.join(__dirname, 'data');
 const DATA_FILE = path.join(DATA_DIR, 'store.json');
+const QUEUE_FILE = path.join(DATA_DIR, 'queue.json');
+const UPLOADS_DIR = path.join(__dirname, 'uploads');
 const FRONTEND_DIR = path.join(__dirname, '..', 'frontend');
 const awsRegion = process.env.AWS_REGION || 'us-east-1';
+
+// AWS SDK Clients
 const s3 = process.env.AWS_ACCESS_KEY_ID ? new AWS.S3({ region: awsRegion }) : null;
 const sqs = process.env.AWS_ACCESS_KEY_ID ? new AWS.SQS({ region: awsRegion }) : null;
 const sns = process.env.AWS_ACCESS_KEY_ID ? new AWS.SNS({ region: awsRegion }) : null;
 const dynamodb = process.env.AWS_ACCESS_KEY_ID ? new AWS.DynamoDB.DocumentClient({ region: awsRegion }) : null;
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
-const localQueue = [];
+
+// Multer para upload de imagens (memória para repassar para S3 ou disco)
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 }
+});
+
 let redisClient = null;
-let testStateInitialized = false;
+const localAuditLogs = [];
 
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static(FRONTEND_DIR));
+app.use('/uploads', express.static(UPLOADS_DIR));
 
-function ensureDataFile() {
+// Garante estrutura de arquivos locais para fallback
+function ensureDirectories() {
   if (!fs.existsSync(DATA_DIR)) {
     fs.mkdirSync(DATA_DIR, { recursive: true });
   }
+  const rawDir = path.join(UPLOADS_DIR, 'banners', 'raw');
+  const processedDir = path.join(UPLOADS_DIR, 'banners', 'processed');
+  fs.mkdirSync(rawDir, { recursive: true });
+  fs.mkdirSync(processedDir, { recursive: true });
 
-  const initialData = {
-    users: [],
-    orders: [],
-    events: [
-      {
-        id: 'match-1',
-        teamHome: 'São Paulo FC',
-        teamAway: 'Palmeiras',
-        stadium: 'Estádio do Morumbi',
-        date: '2026-10-15T18:30:00',
-        price: 120,
-        available: 320,
-        category: 'Arquibancada'
-      },
-      {
-        id: 'match-2',
-        teamHome: 'Flamengo',
-        teamAway: 'Vasco',
-        stadium: 'Maracanã',
-        date: '2026-10-22T20:00:00',
-        price: 180,
-        available: 210,
-        category: 'Cadeiras laterais'
-      },
-      {
-        id: 'match-3',
-        teamHome: 'Grêmio',
-        teamAway: 'Internacional',
-        stadium: 'Arena do Grêmio',
-        date: '2026-10-29T19:45:00',
-        price: 150,
-        available: 260,
-        category: 'Superior'
-      }
-    ],
-    products: []
-  };
+  const initialEvents = [
+    {
+      id: 'match-1',
+      teamHome: 'São Paulo FC',
+      teamAway: 'Palmeiras',
+      stadium: 'Estádio do Morumbi',
+      date: '2026-10-15T18:30:00',
+      price: 120.00,
+      available: 320,
+      category: 'Arquibancada',
+      description: 'Clássico Choque-Rei pelo Campeonato Brasileiro',
+      bannerUrl: 'https://images.unsplash.com/photo-1508098682722-e99c43a406b2?auto=format&fit=crop&w=600&q=80',
+      thumbnailUrl: null,
+      processingStatus: 'completed'
+    },
+    {
+      id: 'match-2',
+      teamHome: 'Flamengo',
+      teamAway: 'Vasco',
+      stadium: 'Maracanã',
+      date: '2026-10-22T20:00:00',
+      price: 180.00,
+      available: 210,
+      category: 'Cadeiras laterais',
+      description: 'Clássico dos Milhões no Maracanã lotado',
+      bannerUrl: 'https://images.unsplash.com/photo-1522778119026-d647f0596c20?auto=format&fit=crop&w=600&q=80',
+      thumbnailUrl: null,
+      processingStatus: 'completed'
+    },
+    {
+      id: 'match-3',
+      teamHome: 'Grêmio',
+      teamAway: 'Internacional',
+      stadium: 'Arena do Grêmio',
+      date: '2026-10-29T19:45:00',
+      price: 150.00,
+      available: 260,
+      category: 'Superior',
+      description: 'O maior clássico do sul do país',
+      bannerUrl: 'https://images.unsplash.com/photo-1489944440615-453fc2b6a9a9?auto=format&fit=crop&w=600&q=80',
+      thumbnailUrl: null,
+      processingStatus: 'completed'
+    }
+  ];
 
-  const shouldResetTestState = String(PORT) === '3100' && !testStateInitialized;
+  if (!fs.existsSync(DATA_FILE)) {
+    fs.writeFileSync(
+      DATA_FILE,
+      JSON.stringify({ users: [], orders: [], events: initialEvents }, null, 2),
+      'utf8'
+    );
+  }
 
-  if (!fs.existsSync(DATA_FILE) || shouldResetTestState) {
-    fs.writeFileSync(DATA_FILE, JSON.stringify(initialData, null, 2), 'utf8');
-    testStateInitialized = true;
+  if (!fs.existsSync(QUEUE_FILE)) {
+    fs.writeFileSync(QUEUE_FILE, JSON.stringify([], null, 2), 'utf8');
   }
 }
 
 function loadStore() {
-  ensureDataFile();
-  const raw = fs.readFileSync(DATA_FILE, 'utf8');
-  return JSON.parse(raw);
+  ensureDirectories();
+  try {
+    const raw = fs.readFileSync(DATA_FILE, 'utf8');
+    return JSON.parse(raw);
+  } catch (error) {
+    return { users: [], orders: [], events: [] };
+  }
 }
 
 function saveStore(store) {
-  ensureDataFile();
+  ensureDirectories();
   fs.writeFileSync(DATA_FILE, JSON.stringify(store, null, 2), 'utf8');
 }
 
-function hashPassword(password) {
-  return crypto.createHash('sha256').update(`${password}:${JWT_SECRET}`).digest('hex');
-}
-
-function signToken(user) {
-  return jwt.sign({ sub: user.id, email: user.email, name: user.name }, JWT_SECRET, {
-    expiresIn: '7d'
-  });
-}
-
-function getAuthToken(req) {
-  const header = req.headers.authorization || '';
-  return header.startsWith('Bearer ') ? header.slice(7) : null;
-}
-
-function authenticate(req, res, next) {
-  const token = getAuthToken(req);
-
-  if (!token) {
-    return res.status(401).json({ message: 'Token de autenticação ausente.' });
+// ----------------------------------------------------
+// 1. AMAZON RDS (PostgreSQL) - Camada Relacional
+// ----------------------------------------------------
+function getPgConfig() {
+  if (process.env.DATABASE_URL) {
+    return { connectionString: process.env.DATABASE_URL };
   }
+  if (process.env.DB_HOST) {
+    return {
+      host: process.env.DB_HOST,
+      port: process.env.DB_PORT || 5432,
+      user: process.env.DB_USER || 'postgres',
+      password: process.env.DB_PASSWORD || 'postgres',
+      database: process.env.DB_NAME || 'appdb'
+    };
+  }
+  return null;
+}
 
+async function getPgClient() {
+  const config = getPgConfig();
+  if (!config) return null;
   try {
-    const payload = jwt.verify(token, JWT_SECRET);
-    req.user = payload;
-    return next();
+    const client = new Client(config);
+    await client.connect();
+    return client;
   } catch (error) {
-    return res.status(401).json({ message: 'Token inválido ou expirado.' });
-  }
-}
-
-async function connectRedis() {
-  if (redisClient) {
-    return redisClient;
-  }
-
-  const redisUrl = process.env.REDIS_URL || (process.env.REDIS_HOST ? `redis://${process.env.REDIS_HOST}:${process.env.REDIS_PORT || 6379}` : null);
-
-  if (!redisUrl) {
+    console.warn('[RDS PostgreSQL] Conexão falhou:', error.message);
     return null;
-  }
-
-  try {
-    redisClient = Redis.createClient({ url: redisUrl });
-    redisClient.on('error', (error) => console.warn('Redis indisponível:', error.message));
-    await redisClient.connect();
-    return redisClient;
-  } catch (error) {
-    console.warn('Redis não inicializado:', error.message);
-    return null;
-  }
-}
-
-async function getCachedData(key, fetcher, ttlSeconds = 180) {
-  const client = await connectRedis();
-
-  if (!client) {
-    return fetcher();
-  }
-
-  try {
-    const cachedValue = await client.get(key);
-
-    if (cachedValue) {
-      return JSON.parse(cachedValue);
-    }
-
-    const freshValue = await fetcher();
-    await client.set(key, JSON.stringify(freshValue), { EX: ttlSeconds });
-    return freshValue;
-  } catch (error) {
-    console.warn(`Erro ao usar cache Redis para ${key}:`, error.message);
-    return fetcher();
   }
 }
 
 async function ensureRelationalSchema() {
-  if (!process.env.DATABASE_URL && !process.env.DB_HOST) {
-    return null;
-  }
+  const client = await getPgClient();
+  if (!client) return;
 
   try {
-    const client = new Client({
-      connectionString: process.env.DATABASE_URL || `postgresql://${process.env.DB_USER || 'postgres'}:${process.env.DB_PASSWORD || 'postgres'}@${process.env.DB_HOST || 'localhost'}:${process.env.DB_PORT || 5432}/${process.env.DB_NAME || 'appdb'}`
-    });
-
-    await client.connect();
     await client.query(`
-      CREATE TABLE IF NOT EXISTS products (
+      CREATE TABLE IF NOT EXISTS events (
         id VARCHAR(100) PRIMARY KEY,
-        name VARCHAR(200) NOT NULL,
+        team_home VARCHAR(100) NOT NULL,
+        team_away VARCHAR(100) NOT NULL,
+        stadium VARCHAR(150) NOT NULL,
+        event_date TIMESTAMPTZ NOT NULL,
+        category VARCHAR(100) DEFAULT 'Arquibancada',
+        price NUMERIC(10,2) NOT NULL DEFAULT 100.00,
+        available INTEGER NOT NULL DEFAULT 100,
         description TEXT,
-        price NUMERIC(10, 2) DEFAULT 0,
-        category VARCHAR(100),
-        image_url TEXT,
+        banner_url TEXT,
+        thumbnail_url TEXT,
+        processing_status VARCHAR(50) DEFAULT 'completed',
         created_at TIMESTAMPTZ DEFAULT NOW(),
         updated_at TIMESTAMPTZ DEFAULT NOW()
       );
+
+      CREATE TABLE IF NOT EXISTS orders (
+        id VARCHAR(100) PRIMARY KEY,
+        event_id VARCHAR(100) NOT NULL,
+        event_name VARCHAR(200) NOT NULL,
+        customer_name VARCHAR(150) NOT NULL,
+        customer_email VARCHAR(150) NOT NULL,
+        quantity INTEGER NOT NULL,
+        total NUMERIC(10,2) NOT NULL,
+        status VARCHAR(50) DEFAULT 'confirmed',
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS users (
+        id VARCHAR(100) PRIMARY KEY,
+        name VARCHAR(120) NOT NULL,
+        email VARCHAR(150) UNIQUE NOT NULL,
+        password_hash VARCHAR(255) NOT NULL,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      );
     `);
-
-    await client.end();
-    return client;
+    console.log('[RDS PostgreSQL] Schema relacional verificado com sucesso.');
   } catch (error) {
-    console.warn('RDS PostgreSQL indisponível:', error.message);
+    console.warn('[RDS PostgreSQL] Erro ao sincronizar schema:', error.message);
+  } finally {
+    await client.end();
+  }
+}
+
+// ----------------------------------------------------
+// 2. AMAZON ELASTICACHE (Redis) - Camada de Cache
+// ----------------------------------------------------
+async function connectRedis() {
+  if (redisClient && redisClient.isOpen) {
+    return redisClient;
+  }
+
+  const redisUrl = process.env.REDIS_URL || (process.env.REDIS_HOST ? `redis://${process.env.REDIS_HOST}:${process.env.REDIS_PORT || 6379}` : null);
+  if (!redisUrl) return null;
+
+  try {
+    redisClient = Redis.createClient({ url: redisUrl });
+    redisClient.on('error', (err) => console.warn('[ElastiCache Redis] Aviso:', err.message));
+    await redisClient.connect();
+    console.log('[ElastiCache Redis] Conectado com sucesso.');
+    return redisClient;
+  } catch (error) {
+    console.warn('[ElastiCache Redis] Erro ao conectar:', error.message);
     return null;
   }
 }
 
-async function readProductsFromRds() {
-  if (!process.env.DATABASE_URL && !process.env.DB_HOST) {
-    return null;
+async function getCached(key, fetcher, ttlSeconds = 60) {
+  const redis = await connectRedis();
+  if (!redis) {
+    return fetcher();
   }
 
   try {
-    const client = new Client({
-      connectionString: process.env.DATABASE_URL || `postgresql://${process.env.DB_USER || 'postgres'}:${process.env.DB_PASSWORD || 'postgres'}@${process.env.DB_HOST || 'localhost'}:${process.env.DB_PORT || 5432}/${process.env.DB_NAME || 'appdb'}`
-    });
-
-    await client.connect();
-    const result = await client.query('SELECT * FROM products ORDER BY created_at DESC');
-    await client.end();
-    return result.rows;
+    const cached = await redis.get(key);
+    if (cached) {
+      return JSON.parse(cached);
+    }
+    const fresh = await fetcher();
+    if (fresh !== null && fresh !== undefined) {
+      await redis.set(key, JSON.stringify(fresh), { EX: ttlSeconds });
+    }
+    return fresh;
   } catch (error) {
-    console.warn('Não foi possível ler produtos no RDS:', error.message);
-    return null;
+    console.warn(`[ElastiCache Redis] Erro ao buscar cache de ${key}:`, error.message);
+    return fetcher();
   }
 }
 
-async function writeProductToRds(product) {
-  if (!process.env.DATABASE_URL && !process.env.DB_HOST) {
-    return null;
-  }
+async function invalidateCache(keys = ['events:list']) {
+  const redis = await connectRedis();
+  if (!redis) return;
 
   try {
-    const client = new Client({
-      connectionString: process.env.DATABASE_URL || `postgresql://${process.env.DB_USER || 'postgres'}:${process.env.DB_PASSWORD || 'postgres'}@${process.env.DB_HOST || 'localhost'}:${process.env.DB_PORT || 5432}/${process.env.DB_NAME || 'appdb'}`
-    });
-
-    await client.connect();
-    await client.query(
-      `INSERT INTO products (id, name, description, price, category, image_url, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
-       ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, description = EXCLUDED.description, price = EXCLUDED.price, category = EXCLUDED.category, image_url = EXCLUDED.image_url, updated_at = NOW()`,
-      [product.id, product.name, product.description || '', Number(product.price), product.category || 'geral', product.imageUrl || null]
-    );
-    await client.end();
-    return product;
+    for (const key of keys) {
+      await redis.del(key);
+    }
   } catch (error) {
-    console.warn('Não foi possível gravar produto no RDS:', error.message);
-    return null;
+    console.warn('[ElastiCache Redis] Erro ao invalidar cache:', error.message);
   }
 }
 
-async function deleteProductFromRds(productId) {
-  if (!process.env.DATABASE_URL && !process.env.DB_HOST) {
-    return null;
+// ----------------------------------------------------
+// 3. AMAZON DYNAMODB - Auditoria NoSQL de Ações do CRUD
+// ----------------------------------------------------
+async function logCrudAction(action, resource, payload) {
+  const logEntry = {
+    id: crypto.randomUUID(),
+    action,
+    resource,
+    payload: JSON.stringify(payload),
+    timestamp: new Date().toISOString()
+  };
+
+  localAuditLogs.unshift(logEntry);
+  if (localAuditLogs.length > 100) localAuditLogs.pop();
+
+  if (dynamodb && process.env.DYNAMODB_TABLE_NAME) {
+    try {
+      await dynamodb.put({
+        TableName: process.env.DYNAMODB_TABLE_NAME,
+        Item: logEntry
+      }).promise();
+      return logEntry;
+    } catch (error) {
+      console.warn('[DynamoDB] Erro ao salvar log de auditoria:', error.message);
+    }
   }
 
-  try {
-    const client = new Client({
-      connectionString: process.env.DATABASE_URL || `postgresql://${process.env.DB_USER || 'postgres'}:${process.env.DB_PASSWORD || 'postgres'}@${process.env.DB_HOST || 'localhost'}:${process.env.DB_PORT || 5432}/${process.env.DB_NAME || 'appdb'}`
-    });
-
-    await client.connect();
-    await client.query('DELETE FROM products WHERE id = $1', [productId]);
-    await client.end();
-    return true;
-  } catch (error) {
-    console.warn('Não foi possível remover produto no RDS:', error.message);
-    return null;
-  }
+  return logEntry;
 }
 
-async function logCrudAction(action, payload) {
-  if (!dynamodb || !process.env.DYNAMODB_TABLE_NAME) {
-    return null;
-  }
+// ----------------------------------------------------
+// 4. AMAZON S3 - Armazenamento de Arquivos Binários
+// ----------------------------------------------------
+async function uploadToS3(buffer, originalName, subfolder = 'banners/raw') {
+  const extension = path.extname(originalName) || '.jpg';
+  const fileName = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}${extension}`;
 
-  try {
-    const item = {
-      id: crypto.randomUUID(),
-      action,
-      payload: JSON.stringify(payload),
-      timestamp: new Date().toISOString()
-    };
-
-    await dynamodb.put({
-      TableName: process.env.DYNAMODB_TABLE_NAME,
-      Item: item
+  if (s3 && process.env.S3_BUCKET_NAME) {
+    const key = `${subfolder}/${fileName}`;
+    await s3.putObject({
+      Bucket: process.env.S3_BUCKET_NAME,
+      Key: key,
+      Body: buffer,
+      ContentType: 'image/jpeg',
+      ACL: 'public-read'
     }).promise();
 
-    return item;
-  } catch (error) {
-    console.warn('DynamoDB indisponível para auditoria:', error.message);
-    return null;
-  }
-}
-
-async function processUploadedFile(file) {
-  if (!file) {
-    return { processed: false, message: 'Nenhum arquivo enviado.' };
-  }
-
-  if (file.mimetype.startsWith('image/')) {
-    const processedBuffer = await sharp(file.buffer)
-      .resize({ width: 320, height: 320, fit: 'inside', withoutEnlargement: true })
-      .jpeg({ quality: 80 })
-      .toBuffer();
-
     return {
-      processed: true,
-      buffer: processedBuffer,
-      contentType: 'image/jpeg',
-      fileName: `processed-${Date.now()}.jpg`,
-      summary: 'Imagem redimensionada com sucesso.'
+      url: `https://${process.env.S3_BUCKET_NAME}.s3.${awsRegion}.amazonaws.com/${key}`,
+      bucket: process.env.S3_BUCKET_NAME,
+      key,
+      fileName
     };
   }
 
-  const text = file.buffer.toString('utf8');
-  const lines = text.split(/\r?\n/).filter(Boolean);
+  // Fallback local caso S3 não esteja configurado
+  const localTarget = path.join(UPLOADS_DIR, subfolder, fileName);
+  fs.mkdirSync(path.dirname(localTarget), { recursive: true });
+  fs.writeFileSync(localTarget, buffer);
 
   return {
-    processed: true,
-    buffer: Buffer.from(`Arquivo processado. Linhas: ${lines.length}.`, 'utf8'),
-    contentType: 'text/plain',
-    fileName: `processed-${Date.now()}.txt`,
-    summary: `Arquivo processado: ${lines.length} linhas validas.`
+    url: `/uploads/${subfolder}/${fileName}`,
+    localPath: localTarget,
+    fileName
   };
 }
 
-async function uploadBinaryToS3(fileBuffer, fileName, contentType) {
-  if (!s3 || !process.env.S3_BUCKET_NAME) {
-    return null;
-  }
-
-  const key = `products/${Date.now()}-${fileName}`;
-
-  await s3.putObject({
-    Bucket: process.env.S3_BUCKET_NAME,
-    Key: key,
-    Body: fileBuffer,
-    ContentType: contentType,
-    ACL: 'public-read'
-  }).promise();
-
-  return `https://${process.env.S3_BUCKET_NAME}.s3.${awsRegion}.amazonaws.com/${key}`;
-}
-
-async function enqueueProcessingMessage(payload) {
+// ----------------------------------------------------
+// 5. AMAZON SNS / SQS - Desacoplamento Assíncrono (Req. 6)
+// ----------------------------------------------------
+async function enqueueBannerTask(taskPayload) {
   const message = {
-    ...payload,
-    processedAt: new Date().toISOString()
+    type: 'RESCALE_BANNER',
+    ...taskPayload,
+    enqueuedAt: new Date().toISOString()
   };
 
-  if (process.env.SQS_QUEUE_URL && sqs) {
+  // 1. Tenta fila Amazon SQS
+  if (sqs && process.env.SQS_QUEUE_URL) {
     await sqs.sendMessage({
       QueueUrl: process.env.SQS_QUEUE_URL,
       MessageBody: JSON.stringify(message)
     }).promise();
-    return { provider: 'sqs', message };
+    return { provider: 'Amazon SQS', enqueued: true };
   }
 
-  if (process.env.SNS_TOPIC_ARN && sns) {
+  // 2. Tenta Amazon SNS Topic
+  if (sns && process.env.SNS_TOPIC_ARN) {
     await sns.publish({
       TopicArn: process.env.SNS_TOPIC_ARN,
-      Subject: 'Product processing notification',
+      Subject: 'Process Banner Task',
       Message: JSON.stringify(message)
     }).promise();
-    return { provider: 'sns', message };
+    return { provider: 'Amazon SNS', enqueued: true };
   }
 
-  localQueue.push(message);
-  return { provider: 'local-queue', message };
-}
-
-async function processQueueMessage(message) {
-  console.log('[queue] processando mensagem:', message);
-
-  if (message.imageUrl) {
-    console.log(`[queue] arquivo processado para produto ${message.productId}: ${message.imageUrl}`);
-  }
-
-  return true;
-}
-
-async function drainLocalQueue() {
-  if (localQueue.length === 0) {
-    return;
-  }
-
-  const pendingMessages = [...localQueue];
-  localQueue.length = 0;
-
-  for (const message of pendingMessages) {
-    await processQueueMessage(message);
-  }
-}
-
-function getProductListFromStore() {
-  const store = loadStore();
-  return Array.isArray(store.products) ? store.products : [];
-}
-
-async function listProducts() {
-  const rdsProducts = await readProductsFromRds();
-  if (rdsProducts && Array.isArray(rdsProducts)) {
-    return rdsProducts.map((product) => ({
-      id: product.id,
-      name: product.name,
-      description: product.description,
-      price: Number(product.price),
-      category: product.category,
-      imageUrl: product.image_url,
-      createdAt: product.created_at,
-      updatedAt: product.updated_at
-    }));
-  }
-
-  return getProductListFromStore();
-}
-
-async function saveProductsToStore(products) {
-  const store = loadStore();
-  store.products = products;
-  saveStore(store);
-}
-
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    service: 'stadium-ticket-store-api',
-    awsServices: {
-      ec2: 'configured-on-instance',
-      s3: !!process.env.S3_BUCKET_NAME,
-      rds: !!(process.env.DATABASE_URL || process.env.DB_HOST),
-      elasticache: !!(process.env.REDIS_HOST || process.env.REDIS_URL),
-      dynamodb: !!process.env.DYNAMODB_TABLE_NAME,
-      snsSqs: !!(process.env.SNS_TOPIC_ARN || process.env.SQS_QUEUE_URL)
-    }
-  });
-});
-
-app.get('/events', (req, res) => {
-  const store = loadStore();
-  res.json(store.events);
-});
-
-app.get('/products', async (req, res) => {
+  // 3. Fallback fila local (arquivo queue.json lido pelo worker)
   try {
-    const products = await getCachedData('products-cache', async () => listProducts(), 180);
-    return res.json(products);
+    ensureDirectories();
+    const raw = fs.readFileSync(QUEUE_FILE, 'utf8');
+    const queue = JSON.parse(raw);
+    queue.push(message);
+    fs.writeFileSync(QUEUE_FILE, JSON.stringify(queue, null, 2), 'utf8');
+    return { provider: 'Local Queue', enqueued: true };
   } catch (error) {
-    return res.status(500).json({ message: 'Não foi possível listar os produtos.', error: error.message });
+    console.warn('[Queue] Erro ao enfileirar tarefa local:', error.message);
+    return { provider: 'Local Queue (erro)', enqueued: false };
   }
-});
+}
 
-app.get('/products/:id', async (req, res) => {
-  try {
-    const products = await listProducts();
-    const product = products.find((item) => item.id === req.params.id);
-
-    if (!product) {
-      return res.status(404).json({ message: 'Produto não encontrado.' });
+// ----------------------------------------------------
+// OPERAÇÕES DE DADOS (RDS com Fallback Store)
+// ----------------------------------------------------
+async function dbListEvents() {
+  const pg = await getPgClient();
+  if (pg) {
+    try {
+      const result = await pg.query('SELECT * FROM events ORDER BY event_date ASC');
+      await pg.end();
+      return result.rows.map((row) => ({
+        id: row.id,
+        teamHome: row.team_home,
+        teamAway: row.team_away,
+        stadium: row.stadium,
+        date: row.event_date,
+        category: row.category,
+        price: Number(row.price),
+        available: Number(row.available),
+        description: row.description,
+        bannerUrl: row.banner_url,
+        thumbnailUrl: row.thumbnail_url,
+        processingStatus: row.processing_status,
+        createdAt: row.created_at
+      }));
+    } catch (err) {
+      console.warn('[RDS] Erro ao listar eventos, usando store:', err.message);
+      if (pg) await pg.end();
     }
-
-    await logCrudAction('READ', { productId: product.id, productName: product.name });
-    return res.json(product);
-  } catch (error) {
-    return res.status(500).json({ message: 'Erro ao consultar produto.', error: error.message });
-  }
-});
-
-app.post('/products', upload.single('image'), async (req, res) => {
-  const { name, description, price, category } = req.body || {};
-
-  if (!name || !price) {
-    return res.status(400).json({ message: 'Nome e preço do produto são obrigatórios.' });
-  }
-
-  try {
-    const productId = `product-${Date.now()}`;
-    const processed = await processUploadedFile(req.file);
-    let imageUrl = req.body.imageUrl || null;
-
-    if (processed.processed && req.file) {
-      const uploadedUrl = await uploadBinaryToS3(processed.buffer, processed.fileName, processed.contentType);
-      imageUrl = uploadedUrl || `data:${processed.contentType};base64,${processed.buffer.toString('base64')}`;
-    }
-
-    const product = {
-      id: productId,
-      name,
-      description: description || '',
-      price: Number(price),
-      category: category || 'geral',
-      imageUrl,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString()
-    };
-
-    const products = await listProducts();
-    products.unshift(product);
-    await saveProductsToStore(products);
-    await writeProductToRds(product);
-    await logCrudAction('CREATE', product);
-    await enqueueProcessingMessage({ action: 'CREATE', productId: product.id, productName: product.name, imageUrl: product.imageUrl });
-
-    return res.status(201).json({
-      message: 'Produto criado com sucesso.',
-      product,
-      processed: processed.summary || 'Arquivo recebido.'
-    });
-  } catch (error) {
-    return res.status(500).json({ message: 'Erro ao criar produto.', error: error.message });
-  }
-});
-
-app.put('/products/:id', upload.single('image'), async (req, res) => {
-  const { name, description, price, category } = req.body || {};
-
-  try {
-    const products = await listProducts();
-    const index = products.findIndex((item) => item.id === req.params.id);
-
-    if (index === -1) {
-      return res.status(404).json({ message: 'Produto não encontrado.' });
-    }
-
-    const existing = products[index];
-    const processed = req.file ? await processUploadedFile(req.file) : null;
-    let imageUrl = existing.imageUrl;
-
-    if (processed && req.file) {
-      const uploadedUrl = await uploadBinaryToS3(processed.buffer, processed.fileName, processed.contentType);
-      imageUrl = uploadedUrl || `data:${processed.contentType};base64,${processed.buffer.toString('base64')}`;
-    }
-
-    const updatedProduct = {
-      ...existing,
-      name: name || existing.name,
-      description: description ?? existing.description,
-      price: Number(price ?? existing.price),
-      category: category || existing.category,
-      imageUrl: imageUrl || existing.imageUrl,
-      updatedAt: new Date().toISOString()
-    };
-
-    products[index] = updatedProduct;
-    await saveProductsToStore(products);
-    await writeProductToRds(updatedProduct);
-    await logCrudAction('UPDATE', updatedProduct);
-    await enqueueProcessingMessage({ action: 'UPDATE', productId: updatedProduct.id, productName: updatedProduct.name, imageUrl: updatedProduct.imageUrl });
-
-    return res.json({
-      message: 'Produto atualizado com sucesso.',
-      product: updatedProduct,
-      processed: processed ? processed.summary : 'Sem alteração de arquivo.'
-    });
-  } catch (error) {
-    return res.status(500).json({ message: 'Erro ao atualizar produto.', error: error.message });
-  }
-});
-
-app.delete('/products/:id', async (req, res) => {
-  try {
-    const products = await listProducts();
-    const index = products.findIndex((item) => item.id === req.params.id);
-
-    if (index === -1) {
-      return res.status(404).json({ message: 'Produto não encontrado.' });
-    }
-
-    const removed = products.splice(index, 1)[0];
-    await saveProductsToStore(products);
-    await deleteProductFromRds(req.params.id);
-    await logCrudAction('DELETE', removed);
-    await enqueueProcessingMessage({ action: 'DELETE', productId: removed.id, productName: removed.name });
-
-    return res.json({ message: 'Produto removido com sucesso.', product: removed });
-  } catch (error) {
-    return res.status(500).json({ message: 'Erro ao remover produto.', error: error.message });
-  }
-});
-
-app.post('/auth/register', (req, res) => {
-  const { name, email, password } = req.body || {};
-
-  if (!name || !email || !password) {
-    return res.status(400).json({ message: 'Nome, e-mail e senha são obrigatórios.' });
   }
 
   const store = loadStore();
-  const alreadyExists = store.users.some((user) => user.email.toLowerCase() === email.toLowerCase());
+  return store.events || [];
+}
 
-  if (alreadyExists) {
-    return res.status(409).json({ message: 'Este e-mail já está cadastrado.' });
+async function dbGetEventById(id) {
+  const pg = await getPgClient();
+  if (pg) {
+    try {
+      const result = await pg.query('SELECT * FROM events WHERE id = $1', [id]);
+      await pg.end();
+      if (result.rows.length === 0) return null;
+      const row = result.rows[0];
+      return {
+        id: row.id,
+        teamHome: row.team_home,
+        teamAway: row.team_away,
+        stadium: row.stadium,
+        date: row.event_date,
+        category: row.category,
+        price: Number(row.price),
+        available: Number(row.available),
+        description: row.description,
+        bannerUrl: row.banner_url,
+        thumbnailUrl: row.thumbnail_url,
+        processingStatus: row.processing_status,
+        createdAt: row.created_at
+      };
+    } catch (err) {
+      console.warn('[RDS] Erro ao buscar evento por ID, usando store:', err.message);
+      if (pg) await pg.end();
+    }
   }
 
-  const user = {
-    id: `user-${Date.now()}`,
-    name,
-    email: email.toLowerCase(),
-    passwordHash: hashPassword(password),
-    createdAt: new Date().toISOString()
-  };
+  const store = loadStore();
+  return (store.events || []).find((e) => e.id === id) || null;
+}
 
-  store.users.push(user);
+async function dbCreateEvent(eventData) {
+  const pg = await getPgClient();
+  if (pg) {
+    try {
+      await pg.query(
+        `INSERT INTO events 
+         (id, team_home, team_away, stadium, event_date, category, price, available, description, banner_url, thumbnail_url, processing_status, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(), NOW())`,
+        [
+          eventData.id,
+          eventData.teamHome,
+          eventData.teamAway,
+          eventData.stadium,
+          eventData.date,
+          eventData.category || 'Arquibancada',
+          Number(eventData.price),
+          Number(eventData.available),
+          eventData.description || '',
+          eventData.bannerUrl || null,
+          eventData.thumbnailUrl || null,
+          eventData.processingStatus || 'completed'
+        ]
+      );
+      await pg.end();
+    } catch (err) {
+      console.warn('[RDS] Erro ao inserir evento no banco:', err.message);
+      if (pg) await pg.end();
+    }
+  }
+
+  // Grava também no store local
+  const store = loadStore();
+  store.events.unshift(eventData);
   saveStore(store);
 
-  const token = signToken(user);
+  return eventData;
+}
 
-  return res.status(201).json({
-    message: 'Usuário cadastrado com sucesso!',
-    token,
-    user: {
-      id: user.id,
-      name: user.name,
-      email: user.email
+async function dbUpdateEvent(id, updates) {
+  const existing = await dbGetEventById(id);
+  if (!existing) return null;
+
+  const merged = { ...existing, ...updates, updatedAt: new Date().toISOString() };
+
+  const pg = await getPgClient();
+  if (pg) {
+    try {
+      await pg.query(
+        `UPDATE events 
+         SET team_home = $1, team_away = $2, stadium = $3, event_date = $4, category = $5,
+             price = $6, available = $7, description = $8, banner_url = $9, thumbnail_url = $10,
+             processing_status = $11, updated_at = NOW()
+         WHERE id = $12`,
+        [
+          merged.teamHome,
+          merged.teamAway,
+          merged.stadium,
+          merged.date,
+          merged.category,
+          Number(merged.price),
+          Number(merged.available),
+          merged.description,
+          merged.bannerUrl,
+          merged.thumbnailUrl,
+          merged.processingStatus,
+          id
+        ]
+      );
+      await pg.end();
+    } catch (err) {
+      console.warn('[RDS] Erro ao atualizar evento:', err.message);
+      if (pg) await pg.end();
     }
-  });
-});
-
-app.post('/auth/login', (req, res) => {
-  const { email, password } = req.body || {};
-
-  if (!email || !password) {
-    return res.status(400).json({ message: 'E-mail e senha são obrigatórios.' });
   }
 
   const store = loadStore();
-  const user = store.users.find((item) => item.email.toLowerCase() === String(email).toLowerCase());
-
-  if (!user || user.passwordHash !== hashPassword(password)) {
-    return res.status(401).json({ message: 'Credenciais inválidas.' });
+  const idx = store.events.findIndex((e) => e.id === id);
+  if (idx !== -1) {
+    store.events[idx] = merged;
+    saveStore(store);
   }
 
-  const token = signToken(user);
+  return merged;
+}
 
-  return res.json({
-    message: 'Login realizado com sucesso!',
-    token,
-    user: {
-      id: user.id,
-      name: user.name,
-      email: user.email
+async function dbDeleteEvent(id) {
+  const existing = await dbGetEventById(id);
+  if (!existing) return null;
+
+  const pg = await getPgClient();
+  if (pg) {
+    try {
+      await pg.query('DELETE FROM events WHERE id = $1', [id]);
+      await pg.end();
+    } catch (err) {
+      console.warn('[RDS] Erro ao deletar evento:', err.message);
+      if (pg) await pg.end();
     }
-  });
-});
-
-app.get('/auth/me', authenticate, (req, res) => {
-  const store = loadStore();
-  const user = store.users.find((item) => item.id === req.user.sub);
-
-  if (!user) {
-    return res.status(404).json({ message: 'Usuário não encontrado.' });
-  }
-
-  return res.json({
-    id: user.id,
-    name: user.name,
-    email: user.email
-  });
-});
-
-app.post('/orders', (req, res) => {
-  const { eventId, quantity, customerName, customerEmail } = req.body || {};
-  const token = getAuthToken(req);
-  const authenticatedUser = token ? jwt.decode(token, { complete: false }) : null;
-
-  const finalCustomerName = customerName || authenticatedUser?.name || 'Cliente';
-  const finalCustomerEmail = customerEmail || authenticatedUser?.email || 'cliente@local';
-
-  if (!eventId || !quantity || !finalCustomerName || !finalCustomerEmail) {
-    return res.status(400).json({ message: 'Dados incompletos para o pedido.' });
   }
 
   const store = loadStore();
-  const event = store.events.find((item) => item.id === eventId);
+  store.events = store.events.filter((e) => e.id !== id);
+  saveStore(store);
 
-  if (!event) {
-    return res.status(404).json({ message: 'Jogo não encontrado.' });
+  return existing;
+}
+
+// Compra com controle de concorrência no RDS
+async function dbPurchaseTickets(eventId, quantity, customerName, customerEmail) {
+  const pg = await getPgClient();
+  if (pg) {
+    try {
+      await pg.query('BEGIN');
+      // Decrementa de forma atômica se houver saldo suficiente
+      const updateResult = await pg.query(
+        `UPDATE events 
+         SET available = available - $1, updated_at = NOW()
+         WHERE id = $2 AND available >= $1
+         RETURNING *`,
+        [quantity, eventId]
+      );
+
+      if (updateResult.rows.length === 0) {
+        await pg.query('ROLLBACK');
+        await pg.end();
+        return { success: false, reason: 'Ingressos esgotados ou saldo insuficiente.' };
+      }
+
+      const eventRow = updateResult.rows[0];
+      const total = Number(eventRow.price) * quantity;
+      const orderId = `order-${Date.now()}`;
+      const eventName = `${eventRow.team_home} x ${eventRow.team_away}`;
+
+      await pg.query(
+        `INSERT INTO orders (id, event_id, event_name, customer_name, customer_email, quantity, total, status, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'confirmed', NOW())`,
+        [orderId, eventId, eventName, customerName, customerEmail, quantity, total]
+      );
+
+      await pg.query('COMMIT');
+      await pg.end();
+
+      const order = {
+        id: orderId,
+        eventId,
+        eventName,
+        customerName,
+        customerEmail,
+        quantity,
+        total,
+        status: 'confirmed',
+        createdAt: new Date().toISOString()
+      };
+
+      // Atualiza store local
+      const store = loadStore();
+      store.orders.unshift(order);
+      const storeEv = store.events.find((e) => e.id === eventId);
+      if (storeEv) storeEv.available = Number(eventRow.available);
+      saveStore(store);
+
+      return { success: true, order, event: eventRow };
+    } catch (err) {
+      console.warn('[RDS] Erro na transação de compra:', err.message);
+      if (pg) {
+        await pg.query('ROLLBACK').catch(() => {});
+        await pg.end();
+      }
+    }
   }
 
-  if (quantity <= 0 || quantity > 10) {
-    return res.status(400).json({ message: 'Quantidade de ingressos inválida.' });
-  }
+  // Fallback local no store.json
+  const store = loadStore();
+  const event = store.events.find((e) => e.id === eventId);
+  if (!event) return { success: false, reason: 'Evento não encontrado.' };
+  if (event.available < quantity) return { success: false, reason: 'Ingressos esgotados ou saldo insuficiente.' };
 
-  if (quantity > event.available) {
-    return res.status(409).json({ message: 'Quantidade indisponível para o evento selecionado.' });
-  }
-
-  const total = event.price * quantity;
+  const total = Number(event.price) * quantity;
   const order = {
     id: `order-${Date.now()}`,
     eventId,
     eventName: `${event.teamHome} x ${event.teamAway}`,
+    customerName,
+    customerEmail,
     quantity,
     total,
-    customerName: finalCustomerName,
-    customerEmail: finalCustomerEmail,
     status: 'confirmed',
-    createdAt: new Date().toISOString(),
-    userId: authenticatedUser ? authenticatedUser.sub : null
+    createdAt: new Date().toISOString()
   };
 
-  store.orders.push(order);
   event.available -= quantity;
+  store.orders.unshift(order);
   saveStore(store);
 
-  return res.status(201).json({
-    message: 'Pedido confirmado com sucesso!',
-    order
+  return { success: true, order, event };
+}
+
+// ----------------------------------------------------
+// ROTAS DA API
+// ----------------------------------------------------
+
+// 1. Healthcheck detalhado dos serviços da AWS
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    service: 'stadium-tickets-api',
+    instance: {
+      hostname: os.hostname(),
+      platform: os.platform(),
+      uptime: process.uptime()
+    },
+    awsServices: {
+      ec2: process.env.EC2_INSTANCE_ID || 'executando-na-instancia-ec2',
+      rds: !!(process.env.DATABASE_URL || process.env.DB_HOST),
+      elasticache: !!(process.env.REDIS_HOST || process.env.REDIS_URL),
+      s3: !!process.env.S3_BUCKET_NAME,
+      dynamodb: !!process.env.DYNAMODB_TABLE_NAME,
+      sqsSns: !!(process.env.SQS_QUEUE_URL || process.env.SNS_TOPIC_ARN)
+    }
   });
 });
 
+// 2. Rota para teste de estresse de CPU (Parte 2 - Demonstração Auto Scaling)
+app.get('/stress', (req, res) => {
+  const durationMs = Number(req.query.duration || 10000);
+  const start = Date.now();
+  // Loop intensivo de CPU
+  while (Date.now() - start < durationMs) {
+    Math.sqrt(Math.random() * 1000000);
+  }
+  res.json({
+    message: `Carga de CPU executada por ${durationMs}ms`,
+    instance: os.hostname()
+  });
+});
+
+// 3. Listagem de Eventos com Cache no ElastiCache (Redis)
+app.get('/events', async (req, res) => {
+  try {
+    const events = await getCached('events:list', async () => dbListEvents(), 60);
+    res.json(events);
+  } catch (error) {
+    res.status(500).json({ message: 'Erro ao listar eventos.', error: error.message });
+  }
+});
+
+// 4. Detalhes de um Evento (com log de auditoria no DynamoDB)
+app.get('/events/:id', async (req, res) => {
+  try {
+    const event = await getCached(`events:${req.params.id}`, async () => dbGetEventById(req.params.id), 60);
+    if (!event) {
+      return res.status(404).json({ message: 'Evento não encontrado.' });
+    }
+
+    await logCrudAction('READ', 'event', { eventId: event.id, eventName: `${event.teamHome} x ${event.teamAway}` });
+    res.json(event);
+  } catch (error) {
+    res.status(500).json({ message: 'Erro ao buscar evento.', error: error.message });
+  }
+});
+
+// 5. Criação de Evento com Upload de Imagem e Desacoplamento via SQS/SNS
+app.post('/events', upload.single('banner'), async (req, res) => {
+  const { teamHome, teamAway, stadium, date, price, available, category, description } = req.body || {};
+
+  if (!teamHome || !teamAway || !stadium || !date || !price) {
+    return res.status(400).json({ message: 'Campos obrigatórios: time mandante, visitante, estádio, data e preço.' });
+  }
+
+  try {
+    const eventId = `match-${Date.now()}`;
+    let bannerUrl = req.body.bannerUrl || null;
+    let s3Info = null;
+
+    // Se houve envio de imagem binária
+    if (req.file) {
+      s3Info = await uploadToS3(req.file.buffer, req.file.originalname, 'banners/raw');
+      bannerUrl = s3Info.url;
+    }
+
+    const newEvent = {
+      id: eventId,
+      teamHome,
+      teamAway,
+      stadium,
+      date: new Date(date).toISOString(),
+      category: category || 'Arquibancada',
+      price: Number(price),
+      available: Number(available || 100),
+      description: description || '',
+      bannerUrl,
+      thumbnailUrl: null,
+      processingStatus: req.file ? 'pending' : 'completed',
+      createdAt: new Date().toISOString()
+    };
+
+    // 1. Salva no RDS (PostgreSQL)
+    await dbCreateEvent(newEvent);
+
+    // 2. Registra auditoria no DynamoDB (NoSQL)
+    await logCrudAction('CREATE', 'event', newEvent);
+
+    // 3. Invalida cache no Redis
+    await invalidateCache(['events:list']);
+
+    // 4. Se tiver imagem, DESACOPLA o processamento enviando tarefa para o SQS/SNS
+    let queueInfo = null;
+    if (req.file) {
+      queueInfo = await enqueueBannerTask({
+        eventId,
+        bannerUrl,
+        s3Bucket: s3Info?.bucket,
+        s3Key: s3Info?.key,
+        localFilePath: s3Info?.localPath,
+        imageBase64: !s3Info?.bucket ? req.file.buffer.toString('base64') : null,
+        fileName: req.file.originalname
+      });
+    }
+
+    return res.status(201).json({
+      message: 'Evento cadastrado com sucesso!',
+      event: newEvent,
+      decoupledProcessing: queueInfo ? { enqueued: true, provider: queueInfo.provider } : null
+    });
+  } catch (error) {
+    console.error('Erro ao cadastrar evento:', error);
+    return res.status(500).json({ message: 'Erro ao criar evento.', error: error.message });
+  }
+});
+
+// 6. Atualização de Evento (CRUD Update)
+app.put('/events/:id', upload.single('banner'), async (req, res) => {
+  try {
+    const existing = await dbGetEventById(req.params.id);
+    if (!existing) {
+      return res.status(404).json({ message: 'Evento não encontrado.' });
+    }
+
+    const updates = { ...req.body };
+    if (updates.price) updates.price = Number(updates.price);
+    if (updates.available) updates.available = Number(updates.available);
+
+    let s3Info = null;
+    if (req.file) {
+      s3Info = await uploadToS3(req.file.buffer, req.file.originalname, 'banners/raw');
+      updates.bannerUrl = s3Info.url;
+      updates.processingStatus = 'pending';
+    }
+
+    const updated = await dbUpdateEvent(req.params.id, updates);
+
+    // Auditoria no DynamoDB
+    await logCrudAction('UPDATE', 'event', updated);
+
+    // Invalida cache no Redis
+    await invalidateCache(['events:list', `events:${req.params.id}`]);
+
+    // Enfileira processamento no SQS se imagem foi alterada
+    if (req.file) {
+      await enqueueBannerTask({
+        eventId: updated.id,
+        bannerUrl: updated.bannerUrl,
+        s3Bucket: s3Info?.bucket,
+        s3Key: s3Info?.key,
+        localFilePath: s3Info?.localPath,
+        imageBase64: !s3Info?.bucket ? req.file.buffer.toString('base64') : null,
+        fileName: req.file.originalname
+      });
+    }
+
+    return res.json({
+      message: 'Evento atualizado com sucesso!',
+      event: updated
+    });
+  } catch (error) {
+    return res.status(500).json({ message: 'Erro ao atualizar evento.', error: error.message });
+  }
+});
+
+// 7. Exclusão de Evento (CRUD Delete)
+app.delete('/events/:id', async (req, res) => {
+  try {
+    const deleted = await dbDeleteEvent(req.params.id);
+    if (!deleted) {
+      return res.status(404).json({ message: 'Evento não encontrado.' });
+    }
+
+    // Auditoria no DynamoDB
+    await logCrudAction('DELETE', 'event', deleted);
+
+    // Invalida cache no Redis
+    await invalidateCache(['events:list', `events:${req.params.id}`]);
+
+    return res.json({ message: 'Evento removido com sucesso!', event: deleted });
+  } catch (error) {
+    return res.status(500).json({ message: 'Erro ao excluir evento.', error: error.message });
+  }
+});
+
+// 8. Compra de Ingressos (Orders) com controle de estoque concorrente
+app.post('/orders', async (req, res) => {
+  const { eventId, quantity, customerName, customerEmail } = req.body || {};
+
+  if (!eventId || !quantity || Number(quantity) <= 0) {
+    return res.status(400).json({ message: 'ID do evento e quantidade válida são obrigatórios.' });
+  }
+
+  const name = customerName || 'Cliente Torcedor';
+  const email = customerEmail || 'torcedor@email.com';
+
+  try {
+    const result = await dbPurchaseTickets(eventId, Number(quantity), name, email);
+
+    if (!result.success) {
+      return res.status(409).json({ message: result.reason });
+    }
+
+    // Auditoria da compra no DynamoDB
+    await logCrudAction('CREATE', 'order', result.order);
+
+    // Invalida cache do evento no Redis para refletir estoque restante
+    await invalidateCache(['events:list', `events:${eventId}`]);
+
+    return res.status(201).json({
+      message: 'Compra realizada com sucesso!',
+      order: result.order
+    });
+  } catch (error) {
+    return res.status(500).json({ message: 'Erro ao processar compra.', error: error.message });
+  }
+});
+
+// 9. Listagem de Pedidos
+app.get('/orders', async (req, res) => {
+  const pg = await getPgClient();
+  if (pg) {
+    try {
+      const result = await pg.query('SELECT * FROM orders ORDER BY created_at DESC');
+      await pg.end();
+      return res.json(result.rows);
+    } catch (err) {
+      if (pg) await pg.end();
+    }
+  }
+  const store = loadStore();
+  return res.json(store.orders || []);
+});
+
+// 10. Listagem de Logs de Auditoria do DynamoDB (Para avaliação)
+app.get('/audit-logs', async (req, res) => {
+  if (dynamodb && process.env.DYNAMODB_TABLE_NAME) {
+    try {
+      const scanResult = await dynamodb.scan({
+        TableName: process.env.DYNAMODB_TABLE_NAME,
+        Limit: 50
+      }).promise();
+      return res.json(scanResult.Items || []);
+    } catch (err) {
+      console.warn('[DynamoDB] Erro ao consultar logs:', err.message);
+    }
+  }
+  return res.json(localAuditLogs);
+});
+
+// ----------------------------------------------------
+// AUTENTICAÇÃO SIMPLES
+// ----------------------------------------------------
+app.post('/auth/register', (req, res) => {
+  const { name, email, password } = req.body || {};
+  if (!name || !email || !password) {
+    return res.status(400).json({ message: 'Nome, e-mail e senha são obrigatórios.' });
+  }
+  const store = loadStore();
+  if (store.users.some((u) => u.email.toLowerCase() === email.toLowerCase())) {
+    return res.status(409).json({ message: 'E-mail já cadastrado.' });
+  }
+  const user = {
+    id: `user-${Date.now()}`,
+    name,
+    email: email.toLowerCase(),
+    passwordHash: crypto.createHash('sha256').update(`${password}:${JWT_SECRET}`).digest('hex'),
+    createdAt: new Date().toISOString()
+  };
+  store.users.push(user);
+  saveStore(store);
+
+  const token = jwt.sign({ sub: user.id, email: user.email, name: user.name }, JWT_SECRET, { expiresIn: '7d' });
+  return res.status(201).json({ message: 'Usuário cadastrado com sucesso!', token, user });
+});
+
+app.post('/auth/login', (req, res) => {
+  const { email, password } = req.body || {};
+  if (!email || !password) {
+    return res.status(400).json({ message: 'E-mail e senha são obrigatórios.' });
+  }
+  const store = loadStore();
+  const hash = crypto.createHash('sha256').update(`${password}:${JWT_SECRET}`).digest('hex');
+  const user = store.users.find((u) => u.email.toLowerCase() === String(email).toLowerCase() && u.passwordHash === hash);
+  if (!user) {
+    return res.status(401).json({ message: 'Credenciais inválidas.' });
+  }
+  const token = jwt.sign({ sub: user.id, email: user.email, name: user.name }, JWT_SECRET, { expiresIn: '7d' });
+  return res.json({ message: 'Login realizado com sucesso!', token, user });
+});
+
+// Compatibilidade transitória com rotas antigas de produtos
+app.get('/products', async (req, res) => {
+  const events = await dbListEvents();
+  res.json(events);
+});
+
+// Inicialização de serviços
 async function bootstrap() {
+  ensureDirectories();
   await connectRedis();
   await ensureRelationalSchema();
-  setInterval(drainLocalQueue, 5000);
 }
 
-bootstrap().catch((error) => {
-  console.warn('Bootstrap do backend falhou:', error.message);
+bootstrap().catch((err) => {
+  console.warn('[Bootstrap] Aviso:', err.message);
 });
 
 if (require.main === module) {

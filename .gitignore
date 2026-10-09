@@ -3,3 +3,5 @@ node_modules/
 .terraform/
 *.tfstate
 *.tfstate.backup
+especificacao.txt
+backend/uploads/

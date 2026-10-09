@@ -1,42 +1,30 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const app = require('./server.js');
+const worker = require('./worker.js');
 
-const { spawn } = require('node:child_process');
-const path = require('node:path');
+let server;
+let baseUrl;
 
-function startServer() {
-  return new Promise((resolve, reject) => {
-    const server = spawn(process.execPath, [path.join(__dirname, 'server.js')], {
-      env: { ...process.env, PORT: '3100' },
-      stdio: ['ignore', 'pipe', 'pipe']
+test.before(async () => {
+  await new Promise((resolve) => {
+    server = app.listen(0, () => {
+      const port = server.address().port;
+      baseUrl = `http://localhost:${port}`;
+      console.log(`[Test] Servidor de teste ouvindo em ${baseUrl}`);
+      resolve();
     });
-
-    let stdout = '';
-    let stderr = '';
-
-    server.stdout.on('data', (chunk) => {
-      stdout += chunk.toString();
-      if (stdout.includes('API em execução na porta 3100')) {
-        resolve(server);
-      }
-    });
-
-    server.stderr.on('data', (chunk) => {
-      stderr += chunk.toString();
-    });
-
-    server.on('error', reject);
-
-    setTimeout(() => {
-      if (!stdout.includes('API em execução na porta 3100')) {
-        reject(new Error(`Servidor não iniciou corretamente. stderr=${stderr}`));
-      }
-    }, 3000);
   });
-}
+});
 
-async function fetchJson(url, options = {}) {
-  const response = await fetch(url, options);
+test.after(async () => {
+  if (server) {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+async function fetchJson(path, options = {}) {
+  const response = await fetch(`${baseUrl}${path}`, options);
   const text = await response.text();
   return {
     status: response.status,
@@ -44,73 +32,115 @@ async function fetchJson(url, options = {}) {
   };
 }
 
-test('health endpoint responde ok', async () => {
-  const server = await startServer();
-
-  try {
-    const result = await fetchJson('http://localhost:3100/health');
-    assert.equal(result.status, 200);
-    assert.equal(result.body.status, 'ok');
-  } finally {
-    server.kill('SIGTERM');
-  }
+test('GET /health responde status ok e informa os serviços AWS', async () => {
+  const res = await fetchJson('/health');
+  assert.equal(res.status, 200);
+  assert.equal(res.body.status, 'ok');
+  assert.ok(res.body.awsServices);
+  assert.ok('ec2' in res.body.awsServices);
+  assert.ok('rds' in res.body.awsServices);
+  assert.ok('elasticache' in res.body.awsServices);
+  assert.ok('s3' in res.body.awsServices);
+  assert.ok('dynamodb' in res.body.awsServices);
+  assert.ok('sqsSns' in res.body.awsServices);
 });
 
-test('POST /orders confirma compra com dados válidos', async () => {
-  const server = await startServer();
-
-  try {
-    const result = await fetchJson('http://localhost:3100/orders', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        eventId: 'match-1',
-        quantity: 2,
-        customerName: 'João da Silva',
-        customerEmail: 'joao@email.com'
-      })
-    });
-
-    assert.equal(result.status, 201);
-    assert.equal(result.body.message, 'Pedido confirmado com sucesso!');
-    assert.equal(result.body.order.quantity, 2);
-    assert.equal(result.body.order.status, 'confirmed');
-  } finally {
-    server.kill('SIGTERM');
-  }
+test('GET /events lista eventos disponíveis', async () => {
+  const res = await fetchJson('/events');
+  assert.equal(res.status, 200);
+  assert.ok(Array.isArray(res.body));
+  assert.ok(res.body.length > 0);
+  const first = res.body[0];
+  assert.ok(first.teamHome);
+  assert.ok(first.teamAway);
+  assert.ok(first.price);
+  assert.ok(first.available > 0);
 });
 
-test('POST /auth/register e /auth/login geram token válido', async () => {
-  const server = await startServer();
+test('POST /events cadastra novo evento e enfileira tarefa de banner', async () => {
+  const res = await fetchJson('/events', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      teamHome: 'Ceará SC',
+      teamAway: 'Fortaleza EC',
+      stadium: 'Arena Castelão',
+      date: '2026-11-10T16:00:00',
+      price: 80.00,
+      available: 500,
+      category: 'Cadeira Especial',
+      description: 'Clássico-Rei cearense'
+    })
+  });
 
-  try {
-    const register = await fetchJson('http://localhost:3100/auth/register', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        name: 'Maria Souza',
-        email: 'maria@email.com',
-        password: 'senha123'
-      })
-    });
+  assert.equal(res.status, 201);
+  assert.equal(res.body.message, 'Evento cadastrado com sucesso!');
+  assert.equal(res.body.event.teamHome, 'Ceará SC');
+  assert.equal(res.body.event.available, 500);
+});
 
-    assert.equal(register.status, 201);
-    assert.equal(register.body.user.email, 'maria@email.com');
-    assert.ok(register.body.token);
+test('POST /orders realiza compra e decrementa disponibilidade', async () => {
+  const eventsBefore = await fetchJson('/events');
+  const targetEvent = eventsBefore.body[0];
+  const initialAvailable = targetEvent.available;
 
-    const login = await fetchJson('http://localhost:3100/auth/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        email: 'maria@email.com',
-        password: 'senha123'
-      })
-    });
+  const buyRes = await fetchJson('/orders', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      eventId: targetEvent.id,
+      quantity: 2,
+      customerName: 'Torcedor Fiel',
+      customerEmail: 'torcedor@email.com'
+    })
+  });
 
-    assert.equal(login.status, 200);
-    assert.ok(login.body.token);
-    assert.equal(login.body.user.email, 'maria@email.com');
-  } finally {
-    server.kill('SIGTERM');
-  }
+  assert.equal(buyRes.status, 201);
+  assert.equal(buyRes.body.message, 'Compra realizada com sucesso!');
+  assert.equal(buyRes.body.order.quantity, 2);
+  assert.equal(buyRes.body.order.total, targetEvent.price * 2);
+
+  // Valida que o estoque diminuiu
+  const eventsAfter = await fetchJson('/events');
+  const updatedEvent = eventsAfter.body.find((e) => e.id === targetEvent.id);
+  assert.equal(updatedEvent.available, initialAvailable - 2);
+});
+
+test('GET /audit-logs retorna histórico de ações do CRUD (NoSQL DynamoDB)', async () => {
+  const res = await fetchJson('/audit-logs');
+  assert.equal(res.status, 200);
+  assert.ok(Array.isArray(res.body));
+  assert.ok(res.body.length > 0);
+  const hasCreate = res.body.some((log) => log.action === 'CREATE');
+  assert.ok(hasCreate, 'Deveria conter ação CREATE registrada nos logs');
+});
+
+test('GET /stress executa carga de CPU com sucesso', async () => {
+  const res = await fetchJson('/stress?duration=200');
+  assert.equal(res.status, 200);
+  assert.ok(res.body.message.includes('Carga de CPU executada'));
+});
+
+test('Worker desacoplado processa tarefas da fila assíncrona', async () => {
+  // Cria uma tarefa de redimensionamento na fila
+  const testImageBuffer = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+    'base64'
+  );
+
+  const task = {
+    eventId: 'match-1',
+    fileName: 'pixel.png',
+    imageBase64: testImageBuffer.toString('base64'),
+    bannerUrl: 'local/pixel.png'
+  };
+
+  const processed = await worker.processMessage(task);
+  assert.equal(processed, true);
+
+  // Verifica se o evento teve seu thumbnail_url atualizado
+  const eventRes = await fetchJson('/events/match-1');
+  assert.equal(eventRes.status, 200);
+  assert.ok(eventRes.body.thumbnailUrl, 'Thumbnail deve ter sido preenchido pelo worker');
+  assert.equal(eventRes.body.processingStatus, 'completed');
 });

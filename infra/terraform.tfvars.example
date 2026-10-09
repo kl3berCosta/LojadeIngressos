@@ -1,5 +1,19 @@
-aws_region = "us-east-1"
-project_name = "stadiumtickets"
-environment = "dev"
-frontend_bucket_name = "stadium-tickets-frontend-demo"
-admin_email = "admin@example.com"
+# Exemplo de configuração de variáveis do Terraform
+aws_region        = "us-east-1"
+project_name      = "stadium-tickets"
+environment       = "dev"
+instance_type     = "t3.micro"
+db_instance_class = "db.t3.micro"
+redis_node_type   = "cache.t3.micro"
+
+# Credenciais do Banco Relacional RDS
+db_name     = "stadiumdb"
+db_username = "postgresadmin"
+db_password = "StadiumPass2026!"
+
+# URL do repositório para a EC2 clonar
+repo_url = "https://github.com/Jeovani4lv3s/LojadeIngressos.git"
+
+# Caso esteja executando em conta do AWS Academy Learner Lab:
+# use_existing_lab_role = true
+# lab_role_name         = "LabRole"
